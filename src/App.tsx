@@ -1,28 +1,41 @@
 import { Dialog, Transition } from '@headlessui/react';
 import {
-  LanguageIcon,
+  ArrowDownTrayIcon,
+  CheckIcon,
   LinkIcon,
   MagnifyingGlassIcon,
+  MoonIcon,
   PencilIcon,
   PlusIcon,
   QuestionMarkCircleIcon,
+  SunIcon,
   TrashIcon,
   XMarkIcon,
 } from '@heroicons/react/24/solid';
 import axios from 'axios';
-import Fuse from 'fuse.js';
-import produce from 'immer';
-import { debounce, maxBy, uniqWith } from 'lodash';
+import Fuse, { type FuseResult } from 'fuse.js';
+import { debounce, uniqWith } from 'lodash';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Dropzone from 'react-dropzone';
-import { useForm } from 'react-hook-form';
 import { toast, ToastContainer } from 'react-toastify';
-import { ReactZoomPanPinchRef, TransformComponent, TransformWrapper } from 'react-zoom-pan-pinch';
-import { useRecoilState } from 'recoil';
 import { Button } from './Button';
-import { db, GameMap, MapTile, TilePicture } from './db';
-import { activemapState, mulanamodeState } from './state';
-import { alphabet, drawLinks, fuseOptions, getImageSrc } from './utils';
+import { appConfig } from './config';
+import { AxisLabelMode, db, GameMap, MapTile, TileAnnotation, TileMarker, TilePicture } from './db';
+import { configuredScreenshotPresets, getScreenshotPreset } from './presets';
+import { useLocalStorageState } from './state';
+import {
+  annotationPath,
+  cleanDetectedText,
+  drawImageIntoRect,
+  drawLinks,
+  formatAxisLabel,
+  fuseOptions,
+  getObjectFit,
+  getTileImage,
+  loadImage,
+  processImageFile,
+  tileDisplayName,
+} from './utils';
 
 interface TempLink {
   tile: number;
@@ -30,1067 +43,1553 @@ interface TempLink {
   offsetY: number;
 }
 
+interface GridState {
+  rows: Array<Array<MapTile | null>>;
+  minX: number;
+  minY: number;
+  columns: number;
+  rowCount: number;
+}
+
+interface ExportOptions {
+  labels: boolean;
+  annotations: boolean;
+  markers: boolean;
+  links: boolean;
+  emptyCells: boolean;
+  darkBackground: boolean;
+}
+
+type ColorTheme = 'light' | 'dark';
+type ImagePasteHandler = (files: File[]) => Promise<void>;
+type AnnotationTool = 'none' | 'draw' | 'marker';
+
+const DEFAULT_TILE_WIDTH = 320;
+const DEFAULT_TILE_HEIGHT = 180;
+const markerPresets = [
+  { type: 'pin', label: 'PIN', color: '#ef4444' },
+  { type: 'star', label: 'STAR', color: '#f59e0b' },
+  { type: 'warn', label: 'WARN', color: '#eab308' },
+  { type: 'check', label: 'OK', color: '#22c55e' },
+  { type: 'key', label: 'KEY', color: '#38bdf8' },
+  { type: 'door', label: 'DOOR', color: '#a78bfa' },
+  { type: 'loot', label: 'LOOT', color: '#fb7185' },
+] as const;
+
+const defaultExportOptions: ExportOptions = {
+  labels: true,
+  annotations: true,
+  markers: true,
+  links: true,
+  emptyCells: true,
+  darkBackground: false,
+};
+
+function createGrid(tiles: MapTile[]): GridState {
+  const minX = tiles.length ? Math.min(...tiles.map((tile) => tile.x)) : 0;
+  const minY = tiles.length ? Math.min(...tiles.map((tile) => tile.y)) : 0;
+  const maxX = tiles.length ? Math.max(...tiles.map((tile) => tile.x)) : 0;
+  const maxY = tiles.length ? Math.max(...tiles.map((tile) => tile.y)) : 0;
+  const columns = maxX - minX + 1;
+  const rowCount = maxY - minY + 1;
+  const rows = Array.from({ length: rowCount }, () => Array<MapTile | null>(columns).fill(null));
+
+  tiles.forEach((tile) => {
+    rows[tile.y - minY][tile.x - minX] = tile;
+  });
+
+  return { rows, minX, minY, columns, rowCount };
+}
+
+function getCurrentMap(maps: GameMap[], activeMap: number): GameMap | undefined {
+  return maps.find((map) => map.id === activeMap) ?? maps[0];
+}
+
+function renderMarkerIcon(type: string, size: number) {
+  if (type === 'star') {
+    const points = Array.from({ length: 10 }, (_value, index) => {
+      const angle = -Math.PI / 2 + (index * Math.PI) / 5;
+      const radius = index % 2 === 0 ? size : size * 0.45;
+      return `${Math.cos(angle) * radius},${Math.sin(angle) * radius}`;
+    }).join(' ');
+    return <polygon points={points} fill="none" stroke="#fff" strokeWidth="2.5" strokeLinejoin="round" />;
+  }
+  if (type === 'warn') {
+    return (
+      <path
+        d={`M 0 ${-size} L ${size * 0.9} ${size * 0.8} L ${-size * 0.9} ${size * 0.8} Z M 0 ${-size * 0.35} L 0 ${size * 0.25} M 0 ${size * 0.55} L 0 ${size * 0.56}`}
+        fill="none"
+        stroke="#fff"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  if (type === 'check') {
+    return (
+      <path
+        d={`M ${-size * 0.8} 0 L ${-size * 0.25} ${size * 0.55} L ${size * 0.85} ${-size * 0.75}`}
+        fill="none"
+        stroke="#fff"
+        strokeWidth="3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  if (type === 'key') {
+    return (
+      <path
+        d={`M ${-size * 0.85} 0 A ${size * 0.35} ${size * 0.35} 0 1 0 ${-size * 0.15} 0 L ${size * 0.85} 0 M ${size * 0.35} 0 L ${size * 0.35} ${size * 0.45} M ${size * 0.65} 0 L ${size * 0.65} ${size * 0.35}`}
+        fill="none"
+        stroke="#fff"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  if (type === 'door') {
+    return (
+      <path
+        d={`M ${-size * 0.65} ${size * 0.85} L ${-size * 0.65} ${-size * 0.85} L ${size * 0.6} ${-size * 0.7} L ${size * 0.6} ${size * 0.85} Z M ${size * 0.25} 0 L ${size * 0.3} 0`}
+        fill="none"
+        stroke="#fff"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  if (type === 'loot') {
+    return (
+      <path
+        d={`M 0 ${-size * 0.9} L ${size * 0.85} 0 L 0 ${size * 0.9} L ${-size * 0.85} 0 Z M ${-size * 0.45} 0 L ${size * 0.45} 0`}
+        fill="none"
+        stroke="#fff"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    );
+  }
+  return (
+    <path
+      d={`M 0 ${-size * 0.95} C ${size * 0.7} ${-size * 0.95} ${size * 0.95} ${-size * 0.25} ${size * 0.45} ${size * 0.25} L 0 ${size * 0.95} L ${-size * 0.45} ${size * 0.25} C ${-size * 0.95} ${-size * 0.25} ${-size * 0.7} ${-size * 0.95} 0 ${-size * 0.95} Z M 0 ${-size * 0.35} L 0 ${-size * 0.34}`}
+      fill="none"
+      stroke="#fff"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  );
+}
+
 const App = () => {
-  const [maps, setmaps] = useState<GameMap[]>([]);
-  const [allnotes, setallnotes] = useState<MapTile[]>([]);
-  const [map, setmap] = useState<(MapTile | null)[][]>([]);
-  const [maxX, setmaxX] = useState(0);
-  const [maxY, setmaxY] = useState(0);
-  const [isOpen, setIsOpen] = useState(false);
-  const [activeTile, setactiveTile] = useState<MapTile | null>(null);
-  const [tilepics, settilepics] = useState<TilePicture[]>([]);
-  const [activemap, setactivemap] = useRecoilState(activemapState);
-  const { register, handleSubmit, reset, setFocus } = useForm();
-  const [utiles, setutiles] = useState<MapTile[]>([]);
-  const panRef = useRef<ReactZoomPanPinchRef | null>(null);
-  const [maploading, setmaploading] = useState(false);
-  const [linkmode, setlinkmode] = useState<boolean>(false);
-  const [showlinks, setshowlinks] = useState<boolean>(false);
-  const [templink, settemplink] = useState<TempLink>();
-  const [searchresults, setsearchresults] = useState<Fuse.FuseResult<MapTile>[]>([]);
-  const [highlight, sethighlight] = useState<number | null>(null);
-  const [mulanamode, setmulanamode] = useRecoilState(mulanamodeState);
+  const [maps, setMaps] = useState<GameMap[]>([]);
+  const [allNotes, setAllNotes] = useState<MapTile[]>([]);
+  const [grid, setGrid] = useState<GridState>(() => createGrid([]));
+  const [activeMap, setActiveMap] = useLocalStorageState('activemap', -1);
+  const [screenshotPresetId, setScreenshotPresetId] = useLocalStorageState('screenshotPreset', 0);
+  const [colorTheme, setColorTheme] = useLocalStorageState<ColorTheme>('colorTheme', 'light');
+  const [mapLoading, setMapLoading] = useState(false);
+  const [showLinks, setShowLinks] = useState(false);
+  const [linkMode, setLinkMode] = useState(false);
+  const [tempLink, setTempLink] = useState<TempLink>();
+  const [searchResults, setSearchResults] = useState<FuseResult<MapTile>[]>([]);
+  const [highlight, setHighlight] = useState<number | null>(null);
+  const [unsolvedTiles, setUnsolvedTiles] = useState<MapTile[]>([]);
+  const [activeTile, setActiveTile] = useState<MapTile | null>(null);
+  const [tilePictures, setTilePictures] = useState<TilePicture[]>([]);
+  const [tileAnnotations, setTileAnnotations] = useState<TileAnnotation[]>([]);
+  const [tileMarkers, setTileMarkers] = useState<TileMarker[]>([]);
+  const [mapAnnotations, setMapAnnotations] = useState<TileAnnotation[]>([]);
+  const [mapMarkers, setMapMarkers] = useState<TileMarker[]>([]);
+  const [isTileDialogOpen, setIsTileDialogOpen] = useState(false);
+  const [isExportOpen, setIsExportOpen] = useState(false);
+  const [exportOptions, setExportOptions] = useState<ExportOptions>(defaultExportOptions);
+  const [annotationTool, setAnnotationTool] = useState<AnnotationTool>('none');
+  const [activeMarkerType, setActiveMarkerType] = useState<(typeof markerPresets)[number]['type']>('pin');
+  const [selectedMarkerId, setSelectedMarkerId] = useState<number | null>(null);
+  const [draggingMarkerId, setDraggingMarkerId] = useState<number | null>(null);
+  const [draftStroke, setDraftStroke] = useState<TileAnnotation['points']>([]);
+  const [mapPan, setMapPan] = useState({ x: 220, y: 160 });
+  const [mapZoom, setMapZoom] = useState(1);
+  const [isMapPanning, setIsMapPanning] = useState(false);
+  const mapPanStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const mapPanMovedRef = useRef(false);
+  const suppressTileClickRef = useRef(false);
+  const pasteTargetRef = useRef<ImagePasteHandler | null>(null);
+  const drawingRef = useRef(false);
 
-  const tWidth = mulanamode === 1 ? 320 : 431;
-  const tHeight = 240;
+  const currentMap = getCurrentMap(maps, activeMap);
+  const selectedPreset = getScreenshotPreset(screenshotPresetId);
+  const tileWidth = currentMap?.tileWidth ?? selectedPreset.tileWidth ?? DEFAULT_TILE_WIDTH;
+  const tileHeight = currentMap?.tileHeight ?? selectedPreset.tileHeight ?? DEFAULT_TILE_HEIGHT;
+  const columnLabelMode: AxisLabelMode = currentMap?.columnLabelMode ?? 'letters';
+  const rowLabelMode: AxisLabelMode = currentMap?.rowLabelMode ?? 'numbers';
+  const isDarkMode = colorTheme === 'dark';
 
-  async function refreshMap(mapId?: number | null) {
-    setmaploading(true);
-    const maps = await db.maps.toArray();
-    setmaps(maps);
-    if (maps.length > 0) {
-      const dbmapTiles: MapTile[] = [];
-      const dballnotes: MapTile[] = [];
+  function clampMapZoom(value: number): number {
+    return Math.min(4, Math.max(0.15, value));
+  }
+
+  function setBoardZoom(nextZoom: number, origin?: { x: number; y: number }) {
+    const zoom = clampMapZoom(nextZoom);
+    if (!origin) {
+      setMapZoom(zoom);
+      return;
+    }
+
+    const boardX = (origin.x - mapPan.x) / mapZoom;
+    const boardY = (origin.y - mapPan.y) / mapZoom;
+    setMapPan({
+      x: origin.x - boardX * zoom,
+      y: origin.y - boardY * zoom,
+    });
+    setMapZoom(zoom);
+  }
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', isDarkMode);
+    document.documentElement.style.colorScheme = colorTheme;
+  }, [colorTheme, isDarkMode]);
+
+  const refreshMap = useCallback(
+    async (requestedMapId?: number | null) => {
+      setMapLoading(true);
+      const dbMaps = await db.maps.toArray();
+      setMaps(dbMaps);
+
+      if (dbMaps.length === 0) {
+        setGrid(createGrid([]));
+        setAllNotes([]);
+        setMapLoading(false);
+        return;
+      }
+
+      const targetMapId = requestedMapId ?? (activeMap !== -1 ? activeMap : dbMaps[0].id!);
+      const notes: MapTile[] = [];
+      const mapTiles: MapTile[] = [];
+
       await db.tiles.each((tile) => {
-        dballnotes.push({
+        notes.push({
           id: tile.id,
           map: tile.map,
           name: tile.name,
           notes: tile.notes,
           x: tile.x,
           y: tile.y,
-        } as any);
-        if (tile.map === (mapId ? mapId : activemap !== -1 ? activemap : maps[0].id!)) {
-          dbmapTiles.push(tile);
+          unsolved: tile.unsolved,
+        });
+        if (tile.map === targetMapId) {
+          mapTiles.push(tile);
         }
       });
-      setallnotes(dballnotes);
-      const maxX = maxBy(dbmapTiles, 'x') ? maxBy(dbmapTiles, 'x')!.x + 1 : 1;
-      const maxY = maxBy(dbmapTiles, 'y') ? maxBy(dbmapTiles, 'y')!.y + 1 : 1;
-      setmaxX(maxX);
-      setmaxY(maxY);
-      const map: (MapTile | null)[][] = [];
-      for (let index = 0; index < maxY; index++) {
-        map.push(new Array(maxX));
-      }
-      map.forEach((_xrow, yidx) => {
-        for (let xidx = 0; xidx < maxX; xidx++) {
-          map[yidx][xidx] = dbmapTiles.find((tile) => tile.x === xidx && tile.y === yidx) ?? null;
-        }
-      });
-      if (map.length === 0) {
-        map.push([
-          {
-            map: mapId ?? maps[0].id!,
-            x: 0,
-            y: 0,
-          },
-        ]);
-      }
-      setmap(map);
-      if (activemap === -1) {
-        setactivemap(maps[0].id!);
-      }
-      if (showlinks) {
-        const links = await db.tilelinks
-          .where('map')
-          .equals(activemap !== -1 ? activemap : maps[0].id!)
-          .toArray();
-        drawLinks(links);
-      }
-    }
 
-    setmaploading(false);
-  }
+      if (mapTiles.length === 0) {
+        const tileId = await db.tiles.add({ map: targetMapId, x: 0, y: 0 });
+        mapTiles.push({ id: tileId, map: targetMapId, x: 0, y: 0 });
+      }
+
+      setAllNotes(notes);
+      setGrid(createGrid(mapTiles));
+      const tileIds = mapTiles.map((tile) => tile.id!).filter(Boolean);
+      if (tileIds.length > 0) {
+        setMapAnnotations(await db.tileAnnotations.where('tileId').anyOf(tileIds).toArray());
+        setMapMarkers(await db.tileMarkers.where('tileId').anyOf(tileIds).toArray());
+      } else {
+        setMapAnnotations([]);
+        setMapMarkers([]);
+      }
+      if (activeMap === -1) {
+        setActiveMap(targetMapId);
+      }
+      setMapLoading(false);
+    },
+    [activeMap, setActiveMap]
+  );
 
   useEffect(() => {
-    window.addEventListener('contextmenu', (event) => {
-      event.preventDefault();
-    });
+    const preventContextMenu = (event: MouseEvent) => event.preventDefault();
+    window.addEventListener('contextmenu', preventContextMenu);
     refreshMap();
 
     return () => {
-      window.removeEventListener('contextmenu', (event) => {
-        event.preventDefault();
-      });
+      window.removeEventListener('contextmenu', preventContextMenu);
+    };
+  }, [refreshMap]);
+
+  const refreshLinks = useCallback(async () => {
+    const targetMap = currentMap?.id;
+    if (!targetMap) {
+      return;
+    }
+    const links = await db.tilelinks.where('map').equals(targetMap).toArray();
+    drawLinks(links);
+  }, [currentMap?.id]);
+
+  useEffect(() => {
+    if (showLinks) {
+      refreshLinks();
+      return;
+    }
+
+    const canvas = document.getElementById('linecanvas') as HTMLCanvasElement | null;
+    const ctx = canvas?.getContext('2d');
+    if (canvas && ctx) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [refreshLinks, showLinks, grid, tileWidth, tileHeight]);
+
+  async function updateCurrentMap(updates: Partial<GameMap>) {
+    if (!currentMap?.id) {
+      return;
+    }
+    await db.maps.update(currentMap.id, updates);
+    const updatedMaps = await db.maps.toArray();
+    setMaps(updatedMaps);
+  }
+
+  async function applyAutoTileSize(imageWidth: number, imageHeight: number) {
+    if (!currentMap?.id || !getScreenshotPreset(screenshotPresetId).autoDetect) {
+      return;
+    }
+    const hasImage = grid.rows.flat().some((tile) => getTileImage(tile));
+    if (hasImage) {
+      return;
+    }
+
+    await updateCurrentMap({ tileWidth: imageWidth, tileHeight: imageHeight });
+  }
+
+  const processDroppedImage = useCallback(
+    async (acceptedFiles: File[]) => {
+      const processedImage = await processImageFile(acceptedFiles, screenshotPresetId);
+      if (!processedImage) {
+        return;
+      }
+      if (processedImage.presetId !== screenshotPresetId) {
+        setScreenshotPresetId(processedImage.presetId);
+      }
+      await applyAutoTileSize(processedImage.naturalWidth, processedImage.naturalHeight);
+      return processedImage;
+    },
+    [applyAutoTileSize, screenshotPresetId, setScreenshotPresetId]
+  );
+
+  const getPasteProps = useCallback((handler: ImagePasteHandler) => {
+    return {
+      onMouseEnter: () => {
+        pasteTargetRef.current = handler;
+      },
+      onMouseLeave: () => {
+        if (pasteTargetRef.current === handler) {
+          pasteTargetRef.current = null;
+        }
+      },
+      title: 'Drop an image or paste one with Ctrl+V',
     };
   }, []);
 
-  async function refreshLinks() {
-    const links = await db.tilelinks
-      .where('map')
-      .equals(activemap !== -1 ? activemap : maps[0].id!)
-      .toArray();
-    drawLinks(links);
-  }
-
   useEffect(() => {
-    if (showlinks) {
-      refreshLinks();
-    } else {
-      const c: HTMLCanvasElement = document.getElementById('linecanvas') as any;
-      const ctx = c.getContext('2d');
-      if (!ctx) {
+    const onPaste = (event: ClipboardEvent) => {
+      const handler = pasteTargetRef.current;
+      if (!handler) {
         return;
       }
-      ctx.clearRect(0, 0, c.width, c.height);
-    }
-  }, [showlinks]);
 
-  useEffect(() => {
-    if (maps.length > 0 && activemap === -1) {
-      setactivemap(maps[0].id!);
-    }
-  }, [maps, activemap]);
-
-  async function openTile(tile: MapTile) {
-    if (activemap !== tile.map) {
-      setactivemap(tile.map);
-      refreshMap(tile.map);
-    }
-    if (!tile.img) {
-      // searchresult, need to fetch img from db
-      const dbTile = await db.tiles.get(tile.id!);
-      if (dbTile) {
-        setactiveTile({
-          ...tile,
-          img: dbTile.img,
-        });
-      } else {
-        setactiveTile(tile);
+      const activeElement = document.activeElement;
+      if (
+        activeElement instanceof HTMLInputElement ||
+        activeElement instanceof HTMLTextAreaElement ||
+        activeElement instanceof HTMLSelectElement ||
+        activeElement?.getAttribute('contenteditable') === 'true'
+      ) {
+        return;
       }
-    } else {
-      setactiveTile(tile);
-    }
-    reset({
-      name: tile.name,
-      notes: tile.notes,
-      unsolved: tile.unsolved ? 1 : 0,
-    });
-    const newpics = await db.tilepics.where('tileId').equals(tile.id!).toArray();
-    settilepics(newpics);
-    setIsOpen(true);
-  }
 
-  async function onUnsolved() {
-    if (utiles.length === 0) {
-      const unsolvedtiles = await db.tiles.where('unsolved').equals(1).toArray();
-      setutiles(unsolvedtiles);
-    } else {
-      setutiles([]);
-    }
-  }
+      const files = Array.from(event.clipboardData?.items ?? [])
+        .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file !== null);
+
+      if (files.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      handler(files).catch(() => {
+        toast.error('Could not paste image');
+      });
+    };
+
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, []);
 
   async function addMap() {
-    const nameinput = prompt('Enter map name');
-    if (nameinput) {
-      const newMapId = await db.maps.add({
-        name: nameinput,
-      });
-      await db.tiles.add({
-        map: newMapId,
-        x: 0,
-        y: 0,
-      });
-      refreshMap(newMapId);
-      setactivemap(newMapId);
+    const name = prompt('Enter map name');
+    if (!name) {
+      return;
     }
+    const preset = getScreenshotPreset(screenshotPresetId);
+    const newMapId = await db.maps.add({
+      name,
+      tileWidth: preset.tileWidth,
+      tileHeight: preset.tileHeight,
+      columnLabelMode: 'letters',
+      rowLabelMode: 'numbers',
+    });
+    await db.tiles.add({ map: newMapId, x: 0, y: 0 });
+    setActiveMap(newMapId);
+    await refreshMap(newMapId);
   }
 
   async function deleteMap() {
-    if (activemap === activemap && confirm('Are you sure you want to delete the selected map?')) {
-      const mapTiles = await db.tiles.where('map').equals(activemap).toArray();
-      await db.tilepics
-        .where('tileId')
-        .anyOf(mapTiles.map((x) => activemap))
-        .delete();
-      await db.tiles.bulkDelete(mapTiles.map((x) => x.id!));
-      await db.maps.where('id').equals(activemap).delete();
-      const newMaps = await db.maps.toArray();
-      if (newMaps.length > 0) {
-        refreshMap(newMaps[newMaps.length - 1].id!);
-        setactivemap(newMaps[newMaps.length - 1].id!);
-      } else {
-        setmap([]);
-        setmaps([]);
-        setactivemap(0);
-      }
+    if (!currentMap?.id || !confirm('Are you sure you want to delete the selected map?')) {
+      return;
     }
-  }
 
-  async function deleteTile() {
-    if (confirm('Are you sure?')) {
-      await db.tiles.delete(activeTile!.id!);
-      const newmap = produce(map, (draft) => {
-        draft[activeTile!.y!][activeTile!.x!] = null;
-      });
-      const maptiles: MapTile[] = newmap.flat().filter((x) => x !== null) as any;
-      // if first row is all nulls
-      if (newmap[0].every((x) => x === null)) {
-        await db.tiles.bulkPut(maptiles.map((tile) => ({ ...tile, y: tile.y - 1 })));
-      }
-      // if first column is all nulls
-      if (newmap.every((x) => x[0] === null)) {
-        await db.tiles.bulkPut(maptiles.map((tile) => ({ ...tile, x: tile.x - 1 })));
-      }
-      await refreshMap();
-      return setIsOpen(false);
+    const mapTiles = await db.tiles.where('map').equals(currentMap.id).toArray();
+    const tileIds = mapTiles.map((tile) => tile.id!).filter(Boolean);
+    if (tileIds.length > 0) {
+      await db.tilepics.where('tileId').anyOf(tileIds).delete();
+      await db.tileAnnotations.where('tileId').anyOf(tileIds).delete();
+      await db.tileMarkers.where('tileId').anyOf(tileIds).delete();
     }
-  }
-
-  async function deleteLinks() {
-    if (confirm('Are you sure you want to delete link to and from this tile?')) {
-      await db.tilelinks.where('from').equals(activeTile!.id!).or('to').equals(activeTile!.id!).delete();
-      refreshLinks();
-      toast.info('Links deleted');
-    }
-  }
-
-  const addTileNote = useCallback(
-    async (acceptedFiles: File[]) => {
-      const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-      if (!imgSrc) {
-        return;
-      }
-      if (import.meta.env.VITE_API_KEY) {
-        const onlyBase64 = imgSrc.slice(23);
-        toast.info('Detecting text');
-        const result = await axios.post(
-          'https://vision.googleapis.com/v1/images:annotate',
-          {
-            requests: [
-              {
-                image: {
-                  content: onlyBase64,
-                },
-                features: [
-                  {
-                    type: 'TEXT_DETECTION',
-                  },
-                ],
-                imageContext: {
-                  languageHints: ['en'],
-                },
-              },
-            ],
-          },
-          {
-            params: {
-              key: import.meta.env.VITE_API_KEY,
-            },
-          }
-        );
-        let noteText = '';
-        if (mulanamode === 1) {
-          noteText = `${
-            activeTile?.notes ? activeTile.notes + '\n\n' : ''
-          }${result.data.responses[0].fullTextAnnotation.text
-            .replaceAll(/^[\d]*\s*/gm, '')
-            .replace(/\nOK(.|\s)*$/, '')}`;
-        } else {
-          noteText = `${
-            activeTile?.notes ? activeTile.notes + '\n\n' : ''
-          }${result.data.responses[0].fullTextAnnotation.text
-            .replace('Scan Mode', '')
-            .replaceAll(/^[\d]*\s*/gm, '')
-            .replace(/\nCANCEL(.|\s)*$/, '')}`;
-        }
-        await db.tiles.update(activeTile!.id!, {
-          notes: noteText,
-        });
-        const newtile = await db.tiles.get(activeTile!.id!);
-        if (newtile) {
-          if (allnotes.findIndex((x) => x.id === newtile.id) === -1) {
-            setallnotes([
-              ...allnotes,
-              {
-                id: newtile.id,
-                map: newtile.map,
-                name: newtile.name,
-                notes: newtile.notes,
-              } as any,
-            ]);
-          } else {
-            setallnotes(
-              allnotes.map((x) => {
-                if (x.id === newtile.id) {
-                  return {
-                    ...x,
-                    notes: newtile.notes,
-                  };
-                } else {
-                  return x;
-                }
-              })
-            );
-          }
-          setactiveTile(newtile);
-          reset(newtile);
-          setmap(
-            produce(map, (draft) => {
-              draft[activeTile!.y!][activeTile!.x!]!.notes = newtile.notes;
-            })
-          );
-        }
-      }
-
-      const result = await db.tilepics.add({
-        tileId: activeTile!.id!,
-        img: imgSrc,
-      });
-
-      settilepics([
-        ...tilepics,
-        {
-          id: result,
-          tileId: activeTile!.id!,
-          img: imgSrc,
-        },
-      ]);
-    },
-    [activeTile, tilepics]
-  );
-
-  async function onMapChange(x: React.ChangeEvent<HTMLSelectElement>) {
-    setactivemap(Number(x.target.value));
-    setmaploading(true);
-    setshowlinks(false);
-    await refreshMap(Number(x.target.value));
-    setmaploading(false);
-    if (panRef.current) {
-      panRef.current.centerView(0.7);
-    }
-    sethighlight(null);
-    setutiles([]);
+    await db.tilelinks.where('map').equals(currentMap.id).delete();
+    await db.tiles.bulkDelete(tileIds);
+    await db.maps.delete(currentMap.id);
+    const nextMaps = await db.maps.toArray();
+    setActiveMap(nextMaps[0]?.id ?? -1);
+    await refreshMap(nextMaps[0]?.id);
   }
 
   async function renameMap() {
-    const newname = prompt('Insert new name for this map');
-    if (newname) {
-      await db.maps.update(activemap, { name: newname });
-      const maps = await db.maps.toArray();
-      setmaps(maps);
-      toast.info('Map name updated');
+    if (!currentMap?.id) {
+      return;
     }
+    const newName = prompt('Insert new name for this map', currentMap.name);
+    if (!newName) {
+      return;
+    }
+    await updateCurrentMap({ name: newName });
+    toast.info('Map name updated');
   }
 
-  async function onTileLink(tile: MapTile | null, e: React.MouseEvent) {
-    if (linkmode && tile) {
-      if (!templink) {
-        settemplink({
-          tile: tile.id!,
-          offsetX: e.nativeEvent.offsetX,
-          offsetY: e.nativeEvent.offsetY,
-        });
-      }
-      if (templink) {
-        await db.tilelinks.add({
-          from: templink.tile,
-          map: activemap,
-          to: tile.id!,
-          fromOffsetX: templink.offsetX,
-          fromOffsetY: templink.offsetY,
-          toOffsetX: e.nativeEvent.offsetX,
-          toOffsetY: e.nativeEvent.offsetY,
-        });
-        toast.info('Link added');
-        refreshLinks();
-        settemplink(undefined);
-        setlinkmode(false);
-      }
-    } else if (linkmode) {
-      setlinkmode(false);
-      settemplink(undefined);
-      toast.info('Link cancelled');
-    }
+  async function toggleColumnLabelMode() {
+    await updateCurrentMap({ columnLabelMode: columnLabelMode === 'letters' ? 'numbers' : 'letters' });
   }
 
-  const fuse = useMemo(() => new Fuse(allnotes, fuseOptions), [allnotes]);
+  async function toggleRowLabelMode() {
+    await updateCurrentMap({ rowLabelMode: rowLabelMode === 'numbers' ? 'letters' : 'numbers' });
+  }
 
-  const debouncedSearch = debounce((value) => {
-    if (value.length > 3) {
-      const result = uniqWith(
-        fuse.search(value),
-        (a, b) => a.item.name === b.item.name && a.item.notes === b.item.notes
+  async function ensureTileAt(x: number, y: number): Promise<MapTile> {
+    if (!currentMap?.id) {
+      throw new Error('No active map');
+    }
+    const existing = await db.tiles
+      .where('map')
+      .equals(currentMap.id)
+      .filter((tile) => tile.x === x && tile.y === y)
+      .first();
+    if (existing) {
+      return existing;
+    }
+    const tileId = await db.tiles.add({ map: currentMap.id, x, y });
+    const tile = { id: tileId, map: currentMap.id, x, y };
+    await refreshMap(currentMap.id);
+    return tile;
+  }
+
+  async function setTileImage(tile: MapTile | null, x: number, y: number, acceptedFiles: File[]) {
+    const processed = await processDroppedImage(acceptedFiles);
+    if (!processed) {
+      return;
+    }
+
+    const targetTile = tile ?? (await ensureTileAt(x, y));
+    await updateCurrentMap({ tileWidth: processed.naturalWidth, tileHeight: processed.naturalHeight });
+    const updates: Partial<MapTile> = {
+      img: processed.imgSrc,
+      originalImg: processed.imgSrc,
+      naturalWidth: processed.naturalWidth,
+      naturalHeight: processed.naturalHeight,
+      crop: processed.crop,
+      fit: processed.fit,
+    };
+    await db.tiles.update(targetTile.id!, updates);
+    await refreshMap(targetTile.map);
+    if (activeTile?.id === targetTile.id) {
+      setActiveTile({ ...targetTile, ...updates });
+    }
+    toast.info('Tile image updated');
+  }
+
+  async function openTile(tile: MapTile) {
+    const dbTile = tile.id ? (await db.tiles.get(tile.id)) ?? tile : tile;
+    setActiveTile(dbTile);
+    setTilePictures(tile.id ? await db.tilepics.where('tileId').equals(tile.id).toArray() : []);
+    setTileAnnotations(tile.id ? await db.tileAnnotations.where('tileId').equals(tile.id).toArray() : []);
+    setTileMarkers(tile.id ? await db.tileMarkers.where('tileId').equals(tile.id).toArray() : []);
+    setDraftStroke([]);
+    setAnnotationTool('none');
+    setIsTileDialogOpen(true);
+  }
+
+  async function saveActiveTile(updates: Partial<MapTile>) {
+    if (!activeTile?.id) {
+      return;
+    }
+    await db.tiles.update(activeTile.id, updates);
+    const updatedTile = { ...activeTile, ...updates };
+    setActiveTile(updatedTile);
+    await refreshMap(activeTile.map);
+    toast.info('Saved');
+  }
+
+  async function deleteTile() {
+    if (!activeTile?.id || !confirm('Are you sure?')) {
+      return;
+    }
+    await db.tilepics.where('tileId').equals(activeTile.id).delete();
+    await db.tileAnnotations.where('tileId').equals(activeTile.id).delete();
+    await db.tileMarkers.where('tileId').equals(activeTile.id).delete();
+    await db.tilelinks.where('from').equals(activeTile.id).or('to').equals(activeTile.id).delete();
+    await db.tiles.delete(activeTile.id);
+    setIsTileDialogOpen(false);
+    await refreshMap(activeTile.map);
+  }
+
+  async function deleteLinks() {
+    if (!activeTile?.id || !confirm('Are you sure you want to delete links to and from this tile?')) {
+      return;
+    }
+    await db.tilelinks.where('from').equals(activeTile.id).or('to').equals(activeTile.id).delete();
+    await refreshLinks();
+    toast.info('Links deleted');
+  }
+
+  async function addTileNote(acceptedFiles: File[]) {
+    if (!activeTile?.id) {
+      return;
+    }
+    const processed = await processDroppedImage(acceptedFiles);
+    if (!processed) {
+      return;
+    }
+
+    if (import.meta.env.VITE_API_KEY) {
+      const onlyBase64 = processed.imgSrc.slice(processed.imgSrc.indexOf(',') + 1);
+      toast.info('Detecting text');
+      const result = await axios.post(
+        'https://vision.googleapis.com/v1/images:annotate',
+        {
+          requests: [
+            {
+              image: { content: onlyBase64 },
+              features: [{ type: 'TEXT_DETECTION' }],
+              imageContext: { languageHints: ['en'] },
+            },
+          ],
+        },
+        { params: { key: import.meta.env.VITE_API_KEY } }
       );
-      sethighlight(null);
-      setsearchresults(result);
-    } else {
-      setsearchresults([]);
+      const detectedText = cleanDetectedText(result.data.responses[0].fullTextAnnotation?.text, screenshotPresetId);
+      await saveActiveTile({ notes: `${activeTile.notes ? `${activeTile.notes}\n\n` : ''}${detectedText}` });
     }
-  }, 200);
+
+    const id = await db.tilepics.add({ tileId: activeTile.id, img: processed.imgSrc });
+    setTilePictures([...tilePictures, { id, tileId: activeTile.id, img: processed.imgSrc }]);
+  }
+
+  async function onMapChange(event: React.ChangeEvent<HTMLSelectElement>) {
+    const nextMap = Number(event.target.value);
+    setActiveMap(nextMap);
+    setShowLinks(false);
+    setHighlight(null);
+    setUnsolvedTiles([]);
+    await refreshMap(nextMap);
+  }
+
+  async function onUnsolved() {
+    if (unsolvedTiles.length === 0) {
+      setUnsolvedTiles(await db.tiles.where('unsolved').equals(1).toArray());
+      return;
+    }
+    setUnsolvedTiles([]);
+  }
+
+  async function onTileLink(tile: MapTile | null, event: React.MouseEvent) {
+    if (!linkMode || !tile?.id || !currentMap?.id) {
+      setLinkMode(false);
+      setTempLink(undefined);
+      return;
+    }
+
+    if (!tempLink) {
+      setTempLink({ tile: tile.id, offsetX: event.nativeEvent.offsetX, offsetY: event.nativeEvent.offsetY });
+      return;
+    }
+
+    await db.tilelinks.add({
+      from: tempLink.tile,
+      map: currentMap.id,
+      to: tile.id,
+      fromOffsetX: tempLink.offsetX,
+      fromOffsetY: tempLink.offsetY,
+      toOffsetX: event.nativeEvent.offsetX,
+      toOffsetY: event.nativeEvent.offsetY,
+    });
+    toast.info('Link added');
+    setTempLink(undefined);
+    setLinkMode(false);
+    await refreshLinks();
+  }
+
+  function startMapPan(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+    if (event.target instanceof HTMLElement && event.target.closest('button,input,select,textarea,[role="dialog"]')) {
+      return;
+    }
+    mapPanMovedRef.current = false;
+    mapPanStartRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      panX: mapPan.x,
+      panY: mapPan.y,
+    };
+    setIsMapPanning(true);
+  }
+
+  function moveMapPan(event: React.PointerEvent<HTMLDivElement>) {
+    const start = mapPanStartRef.current;
+    if (!start) {
+      return;
+    }
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) {
+      mapPanMovedRef.current = true;
+    }
+    setMapPan({ x: start.panX + deltaX, y: start.panY + deltaY });
+  }
+
+  function stopMapPan() {
+    if (mapPanMovedRef.current) {
+      suppressTileClickRef.current = true;
+      window.setTimeout(() => {
+        suppressTileClickRef.current = false;
+      }, 0);
+    }
+    mapPanStartRef.current = null;
+    setIsMapPanning(false);
+  }
+
+  function onMapWheel(event: React.WheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const origin = {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+    const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+    setBoardZoom(mapZoom * zoomFactor, origin);
+  }
+
+  async function pasteIntoMainTile(tile: MapTile | null, x: number, y: number, files: File[]) {
+    await setTileImage(tile, x, y, files);
+  }
+
+  const fuse = useMemo(() => new Fuse(allNotes, fuseOptions), [allNotes]);
+  const debouncedSearch = useMemo(
+    () =>
+      debounce((value: string) => {
+        if (value.length <= 3) {
+          setSearchResults([]);
+          return;
+        }
+        const results = uniqWith(
+          fuse.search(value),
+          (a, b) => a.item.name === b.item.name && a.item.notes === b.item.notes
+        );
+        setHighlight(null);
+        setSearchResults(results);
+      }, 200),
+    [fuse]
+  );
+
+  function screenToNormalizedPoint(event: React.PointerEvent<SVGSVGElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+      y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+    };
+  }
+
+  async function addMarker(event: React.PointerEvent<SVGSVGElement>) {
+    if (!activeTile?.id) {
+      return;
+    }
+    const point = screenToNormalizedPoint(event);
+    const preset = markerPresets.find((marker) => marker.type === activeMarkerType) ?? markerPresets[0];
+    const id = await db.tileMarkers.add({
+      tileId: activeTile.id,
+      type: preset.type,
+      label: preset.label,
+      color: preset.color,
+      x: point.x,
+      y: point.y,
+    });
+    const marker = { id, tileId: activeTile.id, type: preset.type, label: preset.label, color: preset.color, x: point.x, y: point.y };
+    setTileMarkers([...tileMarkers, marker]);
+    setMapMarkers([...mapMarkers, marker]);
+    setSelectedMarkerId(id);
+  }
+
+  async function deleteSelectedMarker() {
+    if (!selectedMarkerId) {
+      return;
+    }
+    await db.tileMarkers.delete(selectedMarkerId);
+    setTileMarkers(tileMarkers.filter((marker) => marker.id !== selectedMarkerId));
+    setMapMarkers(mapMarkers.filter((marker) => marker.id !== selectedMarkerId));
+    setSelectedMarkerId(null);
+  }
+
+  async function moveMarker(markerId: number, point: { x: number; y: number }) {
+    await db.tileMarkers.update(markerId, point);
+    setTileMarkers(tileMarkers.map((marker) => (marker.id === markerId ? { ...marker, ...point } : marker)));
+    setMapMarkers(mapMarkers.map((marker) => (marker.id === markerId ? { ...marker, ...point } : marker)));
+  }
+
+  function moveMarkerInState(markerId: number, point: { x: number; y: number }) {
+    setTileMarkers((markers) => markers.map((marker) => (marker.id === markerId ? { ...marker, ...point } : marker)));
+    setMapMarkers((markers) => markers.map((marker) => (marker.id === markerId ? { ...marker, ...point } : marker)));
+  }
+
+  async function finishStroke() {
+    drawingRef.current = false;
+    if (!activeTile?.id || draftStroke.length < 2) {
+      setDraftStroke([]);
+      return;
+    }
+    const stroke: Omit<TileAnnotation, 'id'> = {
+      tileId: activeTile.id,
+      color: '#38bdf8',
+      width: 4,
+      points: draftStroke,
+    };
+    const id = await db.tileAnnotations.add(stroke);
+    const annotation = { ...stroke, id };
+    setTileAnnotations([...tileAnnotations, annotation]);
+    setMapAnnotations([...mapAnnotations, annotation]);
+    setDraftStroke([]);
+  }
+
+  async function exportMap() {
+    if (!currentMap?.id) {
+      return;
+    }
+    const tiles = grid.rows.flat().filter((tile): tile is MapTile => tile !== null);
+    const canvas = document.createElement('canvas');
+    canvas.width = grid.columns * tileWidth;
+    canvas.height = grid.rowCount * tileHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return;
+    }
+    ctx.fillStyle = exportOptions.darkBackground ? '#020617' : '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    for (const tile of tiles) {
+      const imageSrc = getTileImage(tile);
+      const dx = (tile.x - grid.minX) * tileWidth;
+      const dy = (tile.y - grid.minY) * tileHeight;
+      if (imageSrc) {
+        const img = await loadImage(imageSrc);
+        drawImageIntoRect(ctx, img, dx, dy, tileWidth, tileHeight, getObjectFit(tile), tile.crop);
+      } else if (exportOptions.emptyCells) {
+        ctx.strokeStyle = exportOptions.darkBackground ? '#334155' : '#cbd5e1';
+        ctx.strokeRect(dx, dy, tileWidth, tileHeight);
+      }
+      if (exportOptions.labels) {
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+        ctx.fillRect(dx + 6, dy + 6, 54, 24);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '14px sans-serif';
+        ctx.fillText(tileDisplayName(tile, grid.minX, grid.minY, columnLabelMode, rowLabelMode), dx + 12, dy + 23);
+      }
+      if (exportOptions.annotations) {
+        const annotations = await db.tileAnnotations.where('tileId').equals(tile.id!).toArray();
+        annotations.forEach((annotation) => {
+          ctx.beginPath();
+          annotation.points.forEach((point, index) => {
+            const x = dx + point.x * tileWidth;
+            const y = dy + point.y * tileHeight;
+            if (index === 0) {
+              ctx.moveTo(x, y);
+            } else {
+              ctx.lineTo(x, y);
+            }
+          });
+          ctx.strokeStyle = annotation.color;
+          ctx.lineWidth = annotation.width;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        });
+      }
+      if (exportOptions.markers) {
+        const markers = await db.tileMarkers.where('tileId').equals(tile.id!).toArray();
+        markers.forEach((marker) => {
+          const x = dx + marker.x * tileWidth;
+          const y = dy + marker.y * tileHeight;
+          ctx.fillStyle = marker.color ?? '#ef4444';
+          ctx.beginPath();
+          ctx.arc(x, y, 13, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 3;
+          if (marker.type === 'check') {
+            ctx.beginPath();
+            ctx.moveTo(x - 7, y);
+            ctx.lineTo(x - 2, y + 6);
+            ctx.lineTo(x + 8, y - 7);
+            ctx.stroke();
+          } else if (marker.type === 'warn') {
+            ctx.beginPath();
+            ctx.moveTo(x, y - 8);
+            ctx.lineTo(x + 8, y + 7);
+            ctx.lineTo(x - 8, y + 7);
+            ctx.closePath();
+            ctx.stroke();
+          } else if (marker.type === 'star') {
+            ctx.beginPath();
+            for (let index = 0; index < 10; index++) {
+              const angle = -Math.PI / 2 + (index * Math.PI) / 5;
+              const radius = index % 2 === 0 ? 9 : 4;
+              const px = x + Math.cos(angle) * radius;
+              const py = y + Math.sin(angle) * radius;
+              if (index === 0) {
+                ctx.moveTo(px, py);
+              } else {
+                ctx.lineTo(px, py);
+              }
+            }
+            ctx.closePath();
+            ctx.stroke();
+          } else {
+            ctx.beginPath();
+            ctx.moveTo(x - 7, y);
+            ctx.lineTo(x + 7, y);
+            ctx.moveTo(x, y - 7);
+            ctx.lineTo(x, y + 7);
+            ctx.stroke();
+          }
+        });
+      }
+    }
+
+    const linkCanvas = document.getElementById('linecanvas') as HTMLCanvasElement | null;
+    if (exportOptions.links && linkCanvas) {
+      ctx.drawImage(linkCanvas, 0, 0);
+    }
+
+    const anchor = document.createElement('a');
+    anchor.href = canvas.toDataURL('image/png');
+    anchor.download = `${currentMap.name.replaceAll(/\W+/g, '-').toLowerCase()}-map.png`;
+    anchor.click();
+    setIsExportOpen(false);
+  }
+
+  function renderTileOverlay(tile: MapTile, compact = false) {
+    const annotations = mapAnnotations.filter((annotation) => annotation.tileId === tile.id);
+    const markers = mapMarkers.filter((marker) => marker.tileId === tile.id);
+
+    return (
+      <svg className="absolute inset-0 pointer-events-none" viewBox={`0 0 ${tileWidth} ${tileHeight}`} aria-hidden="true">
+        {annotations.map((annotation) => (
+            <path
+              key={`annotation_${annotation.id}`}
+              d={annotationPath(annotation.points, tileWidth, tileHeight)}
+              fill="none"
+              stroke={annotation.color}
+              strokeWidth={annotation.width}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          ))}
+        {markers.map((marker) => (
+            <g key={`marker_${marker.id}`} transform={`translate(${marker.x * tileWidth} ${marker.y * tileHeight})`}>
+              <circle r={compact ? 10 : 13} fill={marker.color ?? '#ef4444'} />
+              {renderMarkerIcon(marker.type, compact ? 8 : 10)}
+            </g>
+          ))}
+      </svg>
+    );
+  }
+
+  const activeTileLabel = activeTile
+    ? tileDisplayName(activeTile, grid.minX, grid.minY, columnLabelMode, rowLabelMode)
+    : '';
 
   return (
-    <div className="h-screen w-screen grid place-items-center absolute overflow-hidden">
-      {
-        <canvas
-          className="opacity-0 absolute translate-x-full z-0"
-          width={mulanamode === 2 ? 832 : 640}
-          height={mulanamode === 2 ? 463 : 480}
-          id="cropcanvas"
-        />
-      }
-      <div className="shadow bg-white fixed top-0 left-0 flex w-full flex-row justify-between items-start p-2 z-[60]">
-        <div className="flex flex-row items-center">
-          <h1 className="mx-2 text-lg font-bold">mtrax.exe</h1>
+    <div className="h-screen w-screen grid place-items-center absolute overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+      <div className="shadow bg-white dark:bg-slate-900 fixed top-0 left-0 flex w-full flex-row justify-between items-start p-2 z-[60]">
+        <div className="flex flex-row items-center flex-wrap gap-2">
+          <h1 className="mx-2 text-lg font-bold tracking-normal flex items-center">
+            <span className="mr-2 inline-grid h-7 w-7 place-items-center rounded-sm bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950 text-sm">
+              GT
+            </span>
+            {appConfig.appName}
+          </h1>
           <button
-            className="rounded-full p-2 bg-blue-500 mr-2 w-9 h-9 flex justify-center items-center text-white"
-            onClick={async () => {
+            aria-label={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            className="p-2 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+            title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            onClick={() => setColorTheme(isDarkMode ? 'light' : 'dark')}
+          >
+            {isDarkMode ? <SunIcon className="w-5 h-5" /> : <MoonIcon className="w-5 h-5" />}
+          </button>
+          <button
+            className="p-2 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+            onClick={() => {
               alert(
-                'Select game version with the numbered button. Create a map with the plus button. Drag screenshot files from the game to the empty tiles to start mapping\n\nLeft click to pan, wheel to zoom, right click to open tile details\n\nTo add a guiding line between two tiles (e.g. loops or portals), click the link adding button on the top and click twice on the map. The line will be drawn between those two points\n\nTo remove links, open a tile and click the Delete Links button'
+                'Create a map, then click empty cells to create blank rooms. Drop or paste screenshots onto a tile to load images. Auto mode keeps original image files and adapts the tile shape from the first screenshot. Use the tile dialog for notes, markers, drawing, and image fit.'
               );
             }}
           >
-            ?
+            <QuestionMarkCircleIcon className="w-5 h-5" />
           </button>
-          {activemap !== -1 && (
-            <button className="rounded-full p-2 bg-red-600 text-white mr-2" onClick={() => deleteMap()}>
+          {currentMap?.id && (
+            <button className="p-2 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition" onClick={deleteMap}>
               <TrashIcon className="w-5 h-5" />
             </button>
           )}
           {maps.length === 0 && (
             <>
-              <span className="mr-2">Version:</span>
-              <button
-                className="rounded-full p-2 bg-orange-600 w-9 h-9 text-white mr-2 flex justify-center items-center"
-                onClick={() => {
-                  if (mulanamode === 1) {
-                    setmulanamode(2);
-                  } else {
-                    setmulanamode(1);
-                  }
-                }}
-              >
-                {mulanamode}
-              </button>
+              <span className="text-sm">Screenshot preset:</span>
+              <select className="text-sm" value={screenshotPresetId} onChange={(event) => setScreenshotPresetId(Number(event.target.value))}>
+                {configuredScreenshotPresets.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </option>
+                ))}
+              </select>
             </>
           )}
-          {activemap !== -1 && (
-            <button
-              className="mr-2 p-2 border-2 rounded-full hover:bg-slate-100 transition"
-              onClick={() => renameMap()}
-            >
+          {currentMap?.id && (
+            <button className="p-2 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition" onClick={renameMap}>
               <PencilIcon className="w-5 h-5" />
             </button>
           )}
           {maps.length > 0 && (
-            <select value={activemap} className="mr-2" onChange={(x) => onMapChange(x)}>
-              {maps &&
-                maps.map((x) => {
-                  return (
-                    <option key={`map_${x.id}`} value={x.id}>
-                      {x.name}
-                    </option>
-                  );
-                })}
+            <select value={activeMap} className="text-sm" onChange={onMapChange}>
+              {maps.map((map) => (
+                <option key={`map_${map.id}`} value={map.id}>
+                  {map.name}
+                </option>
+              ))}
             </select>
           )}
-
-          <button className="mr-2 p-2 border-2 rounded-full hover:bg-slate-100 transition" onClick={() => addMap()}>
+          <button className="p-2 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition" onClick={addMap}>
             <PlusIcon className="w-5 h-5" />
           </button>
-
-          {activemap !== -1 && (
-            <button
-              className={`border border-gray-500 p-2 hover:shadow rounded-sm flex flex-row items-center mr-2 ${
-                utiles.length !== 0 ? 'bg-blue-500 text-white' : ''
-              }`}
-              onClick={() => onUnsolved()}
-            >
-              {utiles.length === 0 ? 'Show unsolved' : 'Hide unsolved'}
-            </button>
+          {currentMap?.id && (
+            <>
+              <button
+                className={`border p-2 hover:shadow rounded-sm flex flex-row items-center ${unsolvedTiles.length !== 0 ? 'bg-blue-500 text-white' : ''}`}
+                onClick={onUnsolved}
+              >
+                {unsolvedTiles.length === 0 ? 'Show unsolved' : 'Hide unsolved'}
+              </button>
+              <button
+                className={`border p-2 hover:shadow rounded-sm flex flex-row items-center ${linkMode ? 'bg-blue-500 text-white' : ''}`}
+                onClick={() => setLinkMode(!linkMode)}
+              >
+                <LinkIcon className="w-5 h-5 mr-2" /> Link
+              </button>
+              <button
+                className={`border p-2 hover:shadow rounded-sm flex flex-row items-center ${showLinks ? 'bg-blue-500 text-white' : ''}`}
+                onClick={() => setShowLinks(!showLinks)}
+              >
+                {showLinks ? 'Hide links' : 'Show links'}
+              </button>
+              <button className="border p-2 hover:shadow rounded-sm flex flex-row items-center" onClick={() => setIsExportOpen(true)}>
+                <ArrowDownTrayIcon className="w-5 h-5 mr-2" /> Download
+              </button>
+            </>
           )}
-          {activemap !== -1 && (
-            <button
-              className={`border border-gray-500 p-2 hover:shadow rounded-sm flex flex-row items-center mr-2 ${
-                showlinks ? 'bg-blue-500 text-white' : ''
-              }`}
-              onClick={() => {
-                setshowlinks(!showlinks);
-              }}
-            >
-              Show links
-            </button>
-          )}
-          {activemap !== -1 && (
-            <button
-              className={`border border-gray-500 p-2 hover:shadow rounded-sm flex flex-row items-center ${
-                linkmode ? 'bg-blue-500 text-white' : ''
-              }`}
-              onClick={() => {
-                setlinkmode(!linkmode);
-                if (!showlinks) {
-                  setshowlinks(true);
-                }
-              }}
-            >
-              <LinkIcon className="w-6 h-6" /> <PlusIcon className="w-6 h-6" />
-            </button>
-          )}
-          <Transition
-            show={utiles.length !== 0}
-            as={Fragment}
-            enter="ease-out duration-300"
-            enterFrom="opacity-0"
-            enterTo="opacity-100"
-            leave="ease-in duration-200"
-            leaveFrom="opacity-100"
-            leaveTo="opacity-0"
-          >
-            <div className="fixed w-full h-screen top-14 left-0 overflow-y-scroll overflow-x-hidden bg-white">
-              <div className="absolute top-0 left-0 flex flex-row flex-wrap w-screen   p-2 pb-16">
-                {utiles.map((x) => {
-                  return (
-                    <div
-                      onClick={() => openTile(x)}
-                      onContextMenu={() => openTile(x)}
-                      className={`w-[${tWidth}px] h-[${tHeight}px] cursor-pointer mr-2 mb-2`}
-                      key={`umap_${x.id}`}
-                    >
-                      <img src={x.img} alt="" />
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </Transition>
         </div>
-
-        <div className="flex flex-col justify-start items-center">
-          <div className="flex flex-row items-center w-80">
-            <span className="mr-2">
-              <MagnifyingGlassIcon className="w-5 h-5" />
-            </span>
-            <input
-              type="search"
-              className="w-full"
-              placeholder="Search notes"
-              onChange={(e) => {
-                // prefix 'include-match' to word to improve searching
-                let searchterm = '';
-                e.currentTarget.value.split(' ').forEach((x) => {
-                  searchterm += `'${x} `;
-                });
-
-                return debouncedSearch(searchterm);
-              }}
-            />
-          </div>
-
-          {searchresults.length > 0 && (
-            <div className="absolute w-96 right-2 top-16 max-h-screen overflow-y-scroll">
-              {searchresults.map((x) => {
-                return (
-                  <div
-                    key={x.refIndex}
-                    onClick={() => {
-                      sethighlight(x.item.id!);
-                      openTile(x.item);
+        {allNotes.length > 0 && (
+          <div className="flex flex-col items-end relative">
+            <div className="flex items-center">
+              <MagnifyingGlassIcon className="w-5 h-5 mr-2" />
+              <input
+                className="w-72"
+                placeholder="Search notes"
+                onChange={(event) => debouncedSearch(event.target.value)}
+              />
+            </div>
+            {searchResults.length > 0 && (
+              <div className="absolute top-11 right-0 w-96 bg-white dark:bg-slate-900 shadow max-h-96 overflow-y-auto z-[90]">
+                {searchResults.map((result) => (
+                  <button
+                    key={`search_${result.item.id}`}
+                    className="block w-full text-left p-2 border-b hover:bg-slate-100 dark:hover:bg-slate-800"
+                    onClick={async () => {
+                      setActiveMap(result.item.map);
+                      await refreshMap(result.item.map);
+                      setHighlight(result.item.id ?? null);
+                      setSearchResults([]);
                     }}
-                    className="drop-shadow cursor-pointer w-full border border-gray-500 rounded-sm mb-2 p-2 bg-white z-40 transition hover:drop-shadow-lg overflow-hidden hover:border-gray-800"
                   >
-                    {x.item.name && <h1 className={`font-bold ${x.item.notes ? 'mb-2' : ''}`}>{x.item.name}</h1>}
-                    {x.item.notes && <p className="whitespace-pre-wrap">{x.item.notes}</p>}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+                    <strong>{result.item.name || tileDisplayName(result.item, grid.minX, grid.minY, columnLabelMode, rowLabelMode)}</strong>
+                    <div className="text-xs line-clamp-2">{result.item.notes}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
-      <Transition
-        show={maploading}
-        as={Fragment}
-        enter="ease-out duration-300"
-        enterFrom="opacity-0"
-        enterTo="opacity-80"
-        leave="ease-in duration-200"
-        leaveFrom="opacity-80"
-        leaveTo="opacity-0"
-      >
-        <div className="z-50 bg-white fixed top-0 left-0 w-screen h-screen flex justify-center items-center">
-          Loading
+      {mapLoading && <span className="fixed top-20 z-[70] bg-white dark:bg-slate-900 px-3 py-2 shadow">Loading...</span>}
+
+      {maps.length === 0 ? (
+        <div className="grid place-items-center gap-3 text-center">
+          <h2 className="text-2xl font-bold">No maps yet</h2>
+          <button className="p-3 border rounded-sm hover:bg-slate-100 dark:hover:bg-slate-800" onClick={addMap}>
+            Create map
+          </button>
         </div>
-      </Transition>
-      <TransformWrapper ref={panRef} limitToBounds={false} doubleClick={{ disabled: true }} minScale={0.3}>
-        <TransformComponent>
-          <div
-            style={{ width: `${maxX * tWidth}px`, height: `${maxY * tHeight}px` }}
-            className="min-w-[100vw] min-h-[100vh] flex flex-row justify-start items-start relative"
-          >
-            <canvas
-              className="z-[87] pointer-events-none"
-              width={maxX * tWidth}
-              height={maxY * tHeight}
-              id="linecanvas"
-            />
-            {map?.map((xrow, yidx) => {
-              return xrow.map((tile, xidx) => {
-                return (
-                  <div
-                    id={`tile_${tile?.id!}`}
-                    key={`${xidx}-${yidx}`}
-                    className={`absolute ${highlight === tile?.id ? 'outline outline-8 outline-pink-500 z-10' : ''} ${
-                      linkmode ? 'cursor-pointer' : ''
-                    }`}
-                    style={{
-                      height: `${tHeight}px`,
-                      width: `${tWidth}px`,
-                      top: `${yidx * tHeight}px`,
-                      left: `${xidx * tWidth}px`,
-                    }}
-                    onClick={(e) => onTileLink(tile, e)}
-                  >
-                    {tile && tile.unsolved == 1 && (
-                      <div>
-                        <QuestionMarkCircleIcon className="w-4 h-4 p-0.5 bg-blue-500 absolute top-0 left-0 z-30 text-white rounded-br-lg" />
-                      </div>
-                    )}
-                    {tile && tile.img && !tile.name && (
-                      <div>
-                        <LanguageIcon className="w-4 h-4 p-0.5 bg-red-500 absolute bottom-0 left-0 z-30 text-white rounded-tr-lg" />
-                      </div>
-                    )}
-                    {(tile === null || !tile.img) && (
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          if (tile?.id) {
-                            await db.tiles.update(tile.id, { img: imgSrc });
-                            setmap(
-                              produce(map, (draft) => {
-                                draft[yidx][xidx]!.img = imgSrc;
-                              })
-                            );
-                          } else {
-                            const result = await db.tiles.add({
-                              map: activemap,
-                              x: xidx,
-                              y: yidx,
-                              img: imgSrc,
-                            });
-                            setmap(
-                              produce(map, (draft) => {
-                                draft[yidx][xidx] = {
-                                  id: result,
-                                  map: activemap,
-                                  x: xidx,
-                                  y: yidx,
-                                  img: imgSrc,
-                                };
-                              })
-                            );
-                          }
-                        }}
-                      >
-                        {({ getRootProps, getInputProps }) => (
-                          <div
-                            className="group w-full h-full border grid place-items-center hover:bg-slate-50 transition after:hover:content-['Drag_image_here'] text-center"
-                            {...getRootProps()}
-                          >
-                            <input {...getInputProps()} />
-                            <span className="group-hover:hidden text-xl">+</span>
-                          </div>
-                        )}
-                      </Dropzone>
-                    )}
-                    {tile && tile.img && (
-                      <img
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          if (highlight === tile.id) {
-                            sethighlight(null);
-                          }
-                          openTile(tile);
-                        }}
-                        title={`${tile.name ? tile.name + ' ' : ''}${alphabet[tile.x]}-${tile.y}`}
-                        className="w-full h-full z-40 !pointer-events-auto"
-                        src={tile.img}
-                      />
-                    )}
-                    {yidx === 0 && (
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          const maptiles: MapTile[] = map.flat().filter((x) => x !== null) as any;
-                          await db.tiles.bulkPut(maptiles.map((tile) => ({ ...tile, y: tile.y + 1 })));
-                          const result = await db.tiles.add({
-                            map: activemap,
-                            x: xidx,
-                            y: 0,
-                            img: imgSrc,
-                          });
-                          setmap(
-                            produce(map, (draft) => {
-                              const newrow = new Array(map[0].length);
-                              newrow.fill(null);
-                              draft.forEach((row) => {
-                                row.forEach((rowtile) => {
-                                  if (rowtile) {
-                                    rowtile.y += 1;
-                                  }
-                                });
-                              });
-                              draft.unshift(newrow);
-                              draft[0][xidx] = {
-                                id: result,
-                                map: activemap,
-                                x: xidx,
-                                y: 0,
-                                img: imgSrc,
-                              };
-                            })
-                          );
-                          setmaxY(maxY + 1);
-                        }}
-                      >
-                        {({ getRootProps, getInputProps }) => (
-                          <div
-                            className={`group absolute h-16 left-0 -top-16 rounded hover:border grid place-items-center hover:bg-slate-100 transition after:hover:content-['Drag_image_here'] text-center`}
-                            style={{
-                              width: `${tWidth}px`,
-                            }}
-                            {...getRootProps()}
-                          >
-                            <input {...getInputProps()} />
-                            <span className="group-hover:hidden font-bold text-xl">{alphabet[xidx]}</span>
-                          </div>
-                        )}
-                      </Dropzone>
-                    )}
-                    {yidx === maxY - 1 && (
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          const result = await db.tiles.add({
-                            map: activemap,
-                            x: xidx,
-                            y: yidx + 1,
-                            img: imgSrc,
-                          });
-
-                          setmap(
-                            produce(map, (draft) => {
-                              const newRow = new Array(map[0].length);
-                              newRow.fill(null);
-                              newRow[xidx] = {
-                                id: result,
-                                map: activemap,
-                                x: xidx,
-                                y: yidx + 1,
-                                img: imgSrc,
-                              };
-                              draft.push(newRow);
-                            })
-                          );
-                          setmaxY(maxY + 1);
-                        }}
-                      >
-                        {({ getRootProps, getInputProps }) => (
-                          <div
-                            className={`group absolute h-16 left-0 -bottom-16 rounded hover:border grid place-items-center hover:bg-slate-100 transition after:hover:content-['Drag_image_here'] text-center`}
-                            style={{
-                              width: `${tWidth}px`,
-                            }}
-                            {...getRootProps()}
-                          >
-                            <input {...getInputProps()} />
-                            <span className="group-hover:hidden text-xl">+</span>
-                          </div>
-                        )}
-                      </Dropzone>
-                    )}
-                    {xidx === 0 && (
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          const maptiles: MapTile[] = map.flat().filter((x) => x !== null) as any;
-                          await db.tiles.bulkPut(maptiles.map((tile) => ({ ...tile, x: tile.x + 1 })));
-                          const result = await db.tiles.add({
-                            map: activemap,
-                            x: 0,
-                            y: yidx,
-                            img: imgSrc,
-                          });
-
-                          setmap(
-                            produce(map, (draft) => {
-                              draft.forEach((row) => {
-                                row.forEach((rowtile) => {
-                                  if (rowtile) {
-                                    rowtile.x += 1;
-                                  }
-                                });
-                              });
-                              draft.forEach((row) => row.unshift(null));
-                              draft[yidx][0] = {
-                                id: result,
-                                map: activemap,
-                                x: 0,
-                                y: yidx,
-                                img: imgSrc,
-                              };
-                            })
-                          );
-                          setmaxX(maxX + 1);
-                        }}
-                      >
-                        {({ getRootProps, getInputProps }) => (
-                          <div
-                            className={`group absolute w-16 -left-16 top-0 rounded hover:border grid place-items-center hover:bg-slate-100 transition after:hover:content-['Drag_image_here'] text-center`}
-                            style={{
-                              height: `${tHeight}px`,
-                            }}
-                            {...getRootProps()}
-                          >
-                            <input {...getInputProps()} />
-                            <span className="group-hover:hidden font-bold text-xl">{yidx + 1}</span>
-                          </div>
-                        )}
-                      </Dropzone>
-                    )}
-                    {xidx === maxX - 1 && (
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          const result = await db.tiles.add({
-                            map: activemap,
-                            x: xidx + 1,
-                            y: yidx,
-                            img: imgSrc,
-                          });
-
-                          setmap(
-                            produce(map, (draft) => {
-                              draft.forEach((row) => row.push(null));
-                              draft[yidx][xidx + 1] = {
-                                id: result,
-                                map: activemap,
-                                x: xidx + 1,
-                                y: yidx,
-                                img: imgSrc,
-                              };
-                            })
-                          );
-                          setmaxX(maxX + 1);
-                        }}
-                      >
-                        {({ getRootProps, getInputProps }) => (
-                          <div
-                            className={`group absolute w-16 -right-16 top-0 rounded hover:border grid place-items-center hover:bg-slate-100 transition after:hover:content-['Drag_image_here'] text-center`}
-                            style={{
-                              height: `${tHeight}px`,
-                            }}
-                            {...getRootProps()}
-                          >
-                            <input {...getInputProps()} />
-                            <span className="group-hover:hidden text-xl">+</span>
-                          </div>
-                        )}
-                      </Dropzone>
-                    )}
-                  </div>
-                );
-              });
-            })}
-          </div>
-        </TransformComponent>
-      </TransformWrapper>
-
-      <Transition appear show={isOpen} as={Fragment}>
-        <Dialog
-          as="div"
-          className="relative z-[80]"
-          onClose={() => {
-            setIsOpen(false);
-          }}
+      ) : (
+        <div
+          className={`absolute inset-0 overflow-hidden pt-24 ${isMapPanning ? 'cursor-grabbing' : 'cursor-grab'}`}
+          onPointerDown={startMapPan}
+          onPointerMove={moveMapPan}
+          onPointerUp={stopMapPan}
+          onPointerCancel={stopMapPan}
+          onPointerLeave={stopMapPan}
+          onWheel={onMapWheel}
         >
-          <Transition.Child
-            as={Fragment}
-            enter="ease-out duration-300"
-            enterFrom="opacity-0"
-            enterTo="opacity-100"
-            leave="ease-in duration-200"
-            leaveFrom="opacity-100"
-            leaveTo="opacity-0"
+          <div className="fixed bottom-6 right-6 z-[70] flex items-center overflow-hidden rounded-sm border bg-white shadow dark:bg-slate-900">
+            <button
+              className="h-11 w-11 text-xl font-bold hover:bg-slate-100 dark:hover:bg-slate-800"
+              title="Zoom out"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={() => setBoardZoom(mapZoom / 1.2)}
+            >
+              -
+            </button>
+            <button
+              className="h-11 min-w-16 px-3 text-sm font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
+              title="Reset zoom"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={() => setBoardZoom(1)}
+            >
+              {Math.round(mapZoom * 100)}%
+            </button>
+            <button
+              className="h-11 w-11 text-xl font-bold hover:bg-slate-100 dark:hover:bg-slate-800"
+              title="Zoom in"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={() => setBoardZoom(mapZoom * 1.2)}
+            >
+              +
+            </button>
+          </div>
+          <div
+            className="relative select-none"
+            style={{
+              transform: `translate(${mapPan.x}px, ${mapPan.y}px) scale(${mapZoom})`,
+              transformOrigin: 'top left',
+              width: `${grid.columns * tileWidth}px`,
+              height: `${grid.rowCount * tileHeight}px`,
+            }}
           >
-            <div className="fixed inset-0 bg-black bg-opacity-25" />
-          </Transition.Child>
-
-          <div className="fixed inset-0 overflow-y-auto grid place-items-center">
-            <div className="flex min-h-full w-full items-center justify-center p-4 text-center max-w-7xl">
-              <Transition.Child
-                as={Fragment}
-                enter="ease-out duration-200"
-                enterFrom="opacity-0 scale-95"
-                enterTo="opacity-100 scale-100"
-                leave="ease-in duration-100"
-                leaveFrom="opacity-100 scale-100"
-                leaveTo="opacity-0 scale-95"
-              >
-                <Dialog.Panel className="w-full max-w-screen transform overflow-hidden rounded-sm bg-white p-6 text-left align-middle shadow-xl transition-all">
-                  <div className="grid grid-cols-6 lg:grid-cols-12 mt-2 gap-4 max-h-[800px]">
-                    <span className="absolute bottom-6 right-6 text-slate-800">{`${alphabet[activeTile?.x ?? 0]}-${
-                      activeTile?.y
-                    }`}</span>
-
-                    <form
-                      className="flex w-full flex-col justify-start items-start mb-4 col-span-6 relative"
-                      onSubmit={handleSubmit(async (values) => {
-                        await db.tiles.update(activeTile!.id!, {
-                          name: values.name,
-                          notes: values.notes,
-                          unsolved: values.unsolved ? 1 : 0,
-                        });
-                        setmap(
-                          produce(map, (draft) => {
-                            draft[activeTile!.y!][activeTile!.x!] = {
-                              ...activeTile,
-                              name: values.name,
-                              notes: values.notes,
-                              unsolved: values.unsolved ? 1 : 0,
-                            } as any;
-                          })
-                        );
-                        setactiveTile({
-                          ...activeTile,
-                          name: values.name,
-                          notes: values.notes,
-                          unsolved: values.unsolved,
-                        } as any);
-                        if (utiles.length > 0) {
-                          const unsolvedtiles = await db.tiles.where('unsolved').equals(1).toArray();
-                          setutiles(unsolvedtiles);
+            <div
+              className="relative"
+              style={{
+                width: `${grid.columns * tileWidth}px`,
+                height: `${grid.rowCount * tileHeight}px`,
+              }}
+            >
+              <canvas
+                id="linecanvas"
+                className="absolute z-40 pointer-events-none"
+                width={grid.columns * tileWidth}
+                height={grid.rowCount * tileHeight}
+              />
+              {grid.rows.map((row, yIndex) =>
+                row.map((tile, xIndex) => {
+                  const x = grid.minX + xIndex;
+                  const y = grid.minY + yIndex;
+                  const imageSrc = getTileImage(tile);
+                  return (
+                    <div
+                      id={tile?.id ? `tile_${tile.id}` : undefined}
+                      key={`${x}-${y}`}
+                      className={`absolute bg-white dark:bg-slate-900 ${
+                        imageSrc ? '' : 'border border-slate-300 dark:border-slate-700'
+                      } ${
+                        highlight === tile?.id ? 'outline outline-8 outline-pink-500 z-10' : ''
+                      } ${linkMode ? 'cursor-crosshair' : 'cursor-pointer'}`}
+                      style={{
+                        height: `${tileHeight}px`,
+                        width: `${tileWidth}px`,
+                        top: `${yIndex * tileHeight}px`,
+                        left: `${xIndex * tileWidth}px`,
+                      }}
+                      onClick={async (event) => {
+                        if (suppressTileClickRef.current) {
+                          return;
                         }
-                        toast.info('Saved');
-                      })}
-                      onLoad={() => setFocus('name')}
+                        if (linkMode) {
+                          await onTileLink(tile, event);
+                          return;
+                        }
+                        const target = tile ?? (await ensureTileAt(x, y));
+                        await openTile(target);
+                      }}
                     >
-                      <span className="text-xs absolute right-0 -top-3 text-gray-600">
-                        Drag here to update map image
-                      </span>
-                      <Dropzone
-                        noClick={true}
-                        onDrop={async (acceptedFiles) => {
-                          const imgSrc = await getImageSrc(acceptedFiles, mulanamode);
-                          await db.tiles.update(activeTile!.id!, { img: imgSrc });
-                          setactiveTile({ ...activeTile, img: imgSrc } as any);
-                          setmap(
-                            produce(map, (draft) => {
-                              draft[activeTile!.y!][activeTile!.x!]!.img = imgSrc;
-                            })
-                          );
-                          toast.info('Tile image updated');
-                        }}
-                      >
-                        {({ getRootProps }) => (
-                          <div className="w-28 transition absolute top-2 right-0 hover:w-full" {...getRootProps()}>
-                            <img src={activeTile?.img} className="" alt="" />
-                          </div>
-                        )}
-                      </Dropzone>
+                      {tile?.unsolved === 1 && (
+                        <QuestionMarkCircleIcon className="w-5 h-5 p-0.5 bg-blue-500 absolute top-0 left-0 z-30 text-white rounded-br-sm" />
+                      )}
+                      {!imageSrc && (
+                        <div
+                          className="w-full h-full grid place-items-center hover:bg-slate-50 dark:hover:bg-slate-800 transition text-center"
+                          {...getPasteProps((files) => pasteIntoMainTile(tile, x, y, files))}
+                        >
+                          <span className="text-xs px-4 text-slate-500">Click to edit tile; hover and paste image</span>
+                        </div>
+                      )}
+                      {imageSrc && tile && (
+                        <img
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            if (highlight === tile.id) {
+                              setHighlight(null);
+                            }
+                            openTile(tile);
+                          }}
+                          title={`${tile.name ? `${tile.name} ` : ''}${tileDisplayName(tile, grid.minX, grid.minY, columnLabelMode, rowLabelMode)}`}
+                          className="w-full h-full z-20 pointer-events-none select-none"
+                          style={{ objectFit: getObjectFit(tile) }}
+                          src={imageSrc}
+                          alt=""
+                          draggable={false}
+                        />
+                      )}
+                      {tile && renderTileOverlay(tile, true)}
+                      {yIndex === 0 && (
+                        <div className="absolute h-16 left-0 -top-16 grid grid-rows-2" style={{ width: `${tileWidth}px` }}>
+                          <button
+                            className="grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm text-sm font-bold"
+                            title="Toggle column labels between letters and numbers"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleColumnLabelMode().catch(() => toast.error('Could not update column labels'));
+                            }}
+                          >
+                            {formatAxisLabel(xIndex, columnLabelMode)}
+                          </button>
+                          <button
+                            className="grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm"
+                            title="Add empty tile above"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              ensureTileAt(x, grid.minY - 1).catch(() => toast.error('Could not add tile'));
+                            }}
+                          >
+                            <PlusIcon className="w-5 h-5" />
+                          </button>
+                        </div>
+                      )}
+                      {yIndex === grid.rowCount - 1 && (
+                        <button
+                          className="absolute h-16 left-0 -bottom-16 grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm"
+                          style={{ width: `${tileWidth}px` }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            ensureTileAt(x, grid.minY + grid.rowCount).catch(() => toast.error('Could not add tile'));
+                          }}
+                        >
+                          <PlusIcon className="w-5 h-5" />
+                        </button>
+                      )}
+                      {xIndex === 0 && (
+                        <div className="absolute w-16 -left-16 top-0 grid grid-cols-2" style={{ height: `${tileHeight}px` }}>
+                          <button
+                            className="grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm text-sm font-bold"
+                            title="Toggle row labels between numbers and letters"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleRowLabelMode().catch(() => toast.error('Could not update row labels'));
+                            }}
+                          >
+                            {formatAxisLabel(yIndex, rowLabelMode)}
+                          </button>
+                          <button
+                            className="grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm"
+                            title="Add empty tile to the left"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              ensureTileAt(grid.minX - 1, y).catch(() => toast.error('Could not add tile'));
+                            }}
+                          >
+                            <PlusIcon className="w-5 h-5" />
+                          </button>
+                        </div>
+                      )}
+                      {xIndex === grid.columns - 1 && (
+                        <button
+                          className="absolute w-16 -right-16 top-0 grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded-sm"
+                          style={{ height: `${tileHeight}px` }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            ensureTileAt(grid.minX + grid.columns, y).catch(() => toast.error('Could not add tile'));
+                          }}
+                        >
+                          <PlusIcon className="w-5 h-5" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
-                      <label className="mb-2 text-lg font-bold" htmlFor="name">
+      <Transition appear show={isTileDialogOpen} as={Fragment}>
+        <Dialog as="div" className="relative z-[80]" onClose={() => setIsTileDialogOpen(false)}>
+          <Transition.Child as={Fragment} enter="ease-out duration-300" enterFrom="opacity-0" enterTo="opacity-100" leave="ease-in duration-200" leaveFrom="opacity-100" leaveTo="opacity-0">
+            <div className="fixed inset-0 bg-black/40" />
+          </Transition.Child>
+          <div className="fixed inset-0 overflow-y-auto grid place-items-center">
+            <Transition.Child as={Fragment} enter="ease-out duration-200" enterFrom="opacity-0 scale-95" enterTo="opacity-100 scale-100" leave="ease-in duration-100" leaveFrom="opacity-100 scale-100" leaveTo="opacity-0 scale-95">
+              <Dialog.Panel className="w-[min(1400px,96vw)] max-h-[92vh] overflow-y-auto rounded-sm bg-white dark:bg-slate-900 p-6 text-left shadow-xl transition-all">
+                {activeTile && (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div className="relative">
+                      <span className="absolute right-0 -top-3 text-xs text-slate-500">{activeTileLabel}</span>
+                      <label className="mb-2 text-lg font-bold block" htmlFor="name">
                         Name
                       </label>
-                      <input className="mb-6 w-96" type="text" {...register('name')} defaultValue={activeTile?.name} />
-                      <label className="mb-2" htmlFor="notes">
+                      <input
+                        id="name"
+                        className="mb-4 w-full"
+                        type="text"
+                        value={activeTile.name ?? ''}
+                        onChange={(event) => setActiveTile({ ...activeTile, name: event.target.value })}
+                      />
+                      <label className="mb-2 block" htmlFor="notes">
                         Notes
                       </label>
                       <textarea
-                        {...register('notes')}
-                        className="w-full min-h-[400px] mb-2"
-                        defaultValue={activeTile?.notes}
+                        id="notes"
+                        className="w-full min-h-[280px] mb-3"
+                        value={activeTile.notes ?? ''}
+                        onChange={(event) => setActiveTile({ ...activeTile, notes: event.target.value })}
                       />
-                      <div className="my-4 flex flex-row items-center">
-                        <input {...register('unsolved')} id="unsolved" type="checkbox" />
-                        <label className="ml-2 select-none" htmlFor="unsolved">
+                      <div className="mb-4 flex flex-row flex-wrap gap-3 items-center">
+                        <label className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={activeTile.unsolved === 1}
+                            onChange={(event) => setActiveTile({ ...activeTile, unsolved: event.target.checked ? 1 : 0 })}
+                          />
                           Unsolved
                         </label>
-                      </div>
-
-                      <button
-                        className="h-10 focus:outline-none text-white bg-purple-700 hover:bg-purple-800 focus:ring-4 focus:ring-purple-300 font-medium rounded-sm text-sm px-5 py-2.5"
-                        type="submit"
-                      >
-                        Save
-                      </button>
-                    </form>
-                    <div className="col-span-6">
-                      <h2 className="mb-2 text-lg font-bold">Images</h2>
-                      <div className={`w-full h-[500px] ${tilepics.length > 0 ? 'overflow-y-scroll' : ''}`}>
-                        {tilepics.map((pic) => {
-                          return (
-                            <div className="relative group" key={`tilepic_${pic.id}`}>
-                              <Button
-                                className="bg-red-600 absolute top-0 right-0 hidden group-hover:flex flex-row items-center"
-                                onClick={async () => {
-                                  if (confirm('Are you sure?')) {
-                                    await db.tilepics.delete(pic.id!);
-                                    settilepics(tilepics.filter((x) => x.id !== pic.id));
-                                  }
-                                }}
-                              >
-                                <TrashIcon className="w-5 h-5 mr-2" /> Remove
-                              </Button>
-                              <img className="mb-1" key={pic.id} src={pic.img} />
-                            </div>
-                          );
-                        })}
-                        {tilepics.length === 0 && (
-                          <div className="w-full h-full flex justify-center items-center text-xs text-gray-500">
-                            No images yet
-                          </div>
+                        {activeTile.naturalWidth && activeTile.naturalHeight && (
+                          <button
+                            type="button"
+                            className="border rounded-sm px-3 py-2 hover:bg-slate-100 dark:hover:bg-slate-800"
+                            onClick={() =>
+                              updateCurrentMap({
+                                tileWidth: activeTile.naturalWidth,
+                                tileHeight: activeTile.naturalHeight,
+                              }).catch(() => toast.error('Could not update tile size'))
+                            }
+                          >
+                            Use image size
+                          </button>
                         )}
                       </div>
-                      <Dropzone noClick={true} onDrop={(acceptedFiles) => addTileNote(acceptedFiles)}>
+                      <div className="flex gap-2">
+                        <Button
+                          onClick={() =>
+                            saveActiveTile({
+                              name: activeTile.name,
+                              notes: activeTile.notes,
+                              unsolved: activeTile.unsolved,
+                            })
+                          }
+                        >
+                          <CheckIcon className="w-5 h-5 mr-2" /> Save
+                        </Button>
+                        <Button onClick={deleteTile}>
+                          <TrashIcon className="w-5 h-5 mr-2" /> Delete tile
+                        </Button>
+                        <Button onClick={deleteLinks}>
+                          <TrashIcon className="w-5 h-5 mr-2" /> Delete links
+                        </Button>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-3 flex flex-wrap gap-2 items-center">
+                        <button
+                          className={`border rounded-sm px-3 py-2 ${annotationTool === 'draw' ? 'bg-blue-500 text-white' : ''}`}
+                          onClick={() => setAnnotationTool(annotationTool === 'draw' ? 'none' : 'draw')}
+                        >
+                          Draw
+                        </button>
+                        <button
+                          className={`border rounded-sm px-3 py-2 ${annotationTool === 'marker' ? 'bg-blue-500 text-white' : ''}`}
+                          onClick={() => setAnnotationTool(annotationTool === 'marker' ? 'none' : 'marker')}
+                        >
+                          Marker
+                        </button>
+                        {markerPresets.map((marker) => (
+                          <button
+                            key={marker.type}
+                            className={`grid h-10 w-10 place-items-center rounded-sm border ${activeMarkerType === marker.type ? 'ring-2 ring-blue-500' : ''}`}
+                            style={{ backgroundColor: marker.color, borderColor: marker.color }}
+                            title={marker.label}
+                            onClick={() => {
+                              setActiveMarkerType(marker.type);
+                              setAnnotationTool('marker');
+                            }}
+                          >
+                            <svg viewBox="-14 -14 28 28" className="h-6 w-6" aria-hidden="true">
+                              {renderMarkerIcon(marker.type, 9)}
+                            </svg>
+                          </button>
+                        ))}
+                        <button
+                          className="border rounded-sm px-3 py-2 disabled:opacity-40"
+                          disabled={!selectedMarkerId}
+                          onClick={() => deleteSelectedMarker().catch(() => toast.error('Could not delete marker'))}
+                        >
+                          Delete marker
+                        </button>
+                        <button
+                          className="border rounded-sm px-3 py-2"
+                          onClick={async () => {
+                            if (!activeTile.id || !confirm('Clear drawings and markers for this tile?')) {
+                              return;
+                            }
+                            await db.tileAnnotations.where('tileId').equals(activeTile.id).delete();
+                            await db.tileMarkers.where('tileId').equals(activeTile.id).delete();
+                            setTileAnnotations([]);
+                            setTileMarkers([]);
+                            setMapAnnotations(mapAnnotations.filter((annotation) => annotation.tileId !== activeTile.id));
+                            setMapMarkers(mapMarkers.filter((marker) => marker.tileId !== activeTile.id));
+                          }}
+                        >
+                          Clear
+                        </button>
+                      </div>
+                      <Dropzone noClick={false} onDrop={(files) => setTileImage(activeTile, activeTile.x, activeTile.y, files)}>
                         {({ getRootProps, getInputProps }) => (
                           <div
-                            className="h-[100px] my-4 w-full rounded border grid place-items-center hover:bg-slate-100 transition text-center"
-                            {...getRootProps()}
+                            className="group relative w-full aspect-video border bg-slate-100 dark:bg-slate-950 grid place-items-center overflow-hidden cursor-pointer"
+                            {...getRootProps(getPasteProps((files) => setTileImage(activeTile, activeTile.x, activeTile.y, files)))}
                           >
                             <input {...getInputProps()} />
-                            <span>Drop your note image here</span>
+                            {getTileImage(activeTile) ? (
+                              <img
+                                className="absolute inset-0 w-full h-full select-none"
+                                style={{ objectFit: getObjectFit(activeTile) }}
+                                src={getTileImage(activeTile)}
+                                alt=""
+                                draggable={false}
+                              />
+                            ) : (
+                              <span className="text-sm text-slate-500">Click, drop, or paste tile image</span>
+                            )}
+                            {annotationTool === 'none' && (
+                              <div className="absolute bottom-3 left-3 rounded-sm bg-slate-950/75 px-3 py-2 text-sm font-medium text-white opacity-0 transition group-hover:opacity-100">
+                                Click, drop, or paste image
+                              </div>
+                            )}
+                            <svg
+                              className={`absolute inset-0 h-full w-full ${annotationTool === 'none' ? 'pointer-events-none' : ''}`}
+                              viewBox="0 0 1 1"
+                              preserveAspectRatio="none"
+                              onPointerDown={(event) => {
+                                event.stopPropagation();
+                                if (annotationTool === 'marker') {
+                                  addMarker(event);
+                                  return;
+                                }
+                                if (annotationTool === 'draw') {
+                                  drawingRef.current = true;
+                                  setDraftStroke([screenToNormalizedPoint(event)]);
+                                }
+                              }}
+                              onPointerMove={(event) => {
+                                if (draggingMarkerId) {
+                                  moveMarkerInState(draggingMarkerId, screenToNormalizedPoint(event));
+                                  return;
+                                }
+                                if (annotationTool !== 'draw' || !drawingRef.current) {
+                                  return;
+                                }
+                                setDraftStroke((points) => [...points, screenToNormalizedPoint(event)]);
+                              }}
+                              onPointerUp={async (event) => {
+                                if (draggingMarkerId) {
+                                  const point = screenToNormalizedPoint(event);
+                                  const markerId = draggingMarkerId;
+                                  setDraggingMarkerId(null);
+                                  await moveMarker(markerId, point);
+                                  return;
+                                }
+                                await finishStroke();
+                              }}
+                              onPointerLeave={async (event) => {
+                                if (draggingMarkerId) {
+                                  const point = screenToNormalizedPoint(event);
+                                  const markerId = draggingMarkerId;
+                                  setDraggingMarkerId(null);
+                                  await moveMarker(markerId, point);
+                                  return;
+                                }
+                                await finishStroke();
+                              }}
+                            >
+                              {tileAnnotations.map((annotation) => (
+                                <polyline
+                                  key={`modal_annotation_${annotation.id}`}
+                                  points={annotation.points.map((point) => `${point.x},${point.y}`).join(' ')}
+                                  fill="none"
+                                  stroke={annotation.color}
+                                  strokeWidth={annotation.width / 320}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  vectorEffect="non-scaling-stroke"
+                                />
+                              ))}
+                              {draftStroke.length > 0 && (
+                                <polyline
+                                  points={draftStroke.map((point) => `${point.x},${point.y}`).join(' ')}
+                                  fill="none"
+                                  stroke="#38bdf8"
+                                  strokeWidth={4 / 320}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  vectorEffect="non-scaling-stroke"
+                                />
+                              )}
+                              {tileMarkers.map((marker) => (
+                                <g
+                                  key={`modal_marker_${marker.id}`}
+                                  className="cursor-move"
+                                  transform={`translate(${marker.x} ${marker.y})`}
+                                  onPointerDown={(event) => {
+                                    event.stopPropagation();
+                                    setSelectedMarkerId(marker.id ?? null);
+                                    if (marker.id) {
+                                      setDraggingMarkerId(marker.id);
+                                    }
+                                  }}
+                                >
+                                  <circle r={selectedMarkerId === marker.id ? '0.046' : '0.037'} fill={marker.color ?? '#ef4444'} vectorEffect="non-scaling-stroke" />
+                                  {selectedMarkerId === marker.id && (
+                                    <circle r="0.052" fill="none" stroke="#fff" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+                                  )}
+                                  <g transform="scale(0.003)">
+                                    {renderMarkerIcon(marker.type, 9)}
+                                  </g>
+                                </g>
+                              ))}
+                            </svg>
+                          </div>
+                        )}
+                      </Dropzone>
+                      <h2 className="mt-5 mb-2 text-lg font-bold">Reference Images</h2>
+                      <div className={`w-full max-h-[320px] ${tilePictures.length > 0 ? 'overflow-y-auto' : ''}`}>
+                        {tilePictures.map((picture) => (
+                          <div className="relative group" key={`tilepic_${picture.id}`}>
+                            <Button
+                              className="bg-red-600 absolute top-0 right-0 hidden group-hover:flex flex-row items-center"
+                              onClick={async () => {
+                                if (confirm('Are you sure?')) {
+                                  await db.tilepics.delete(picture.id!);
+                                  setTilePictures(tilePictures.filter((item) => item.id !== picture.id));
+                                }
+                              }}
+                            >
+                              <TrashIcon className="w-5 h-5 mr-2" /> Remove
+                            </Button>
+                            <img className="mb-1 w-full" src={picture.img} alt="" />
+                          </div>
+                        ))}
+                        {tilePictures.length === 0 && (
+                          <div className="w-full h-24 flex justify-center items-center text-xs text-slate-500">No reference images yet</div>
+                        )}
+                      </div>
+                      <Dropzone noClick={false} onDrop={addTileNote}>
+                        {({ getRootProps, getInputProps }) => (
+                          <div
+                            className="h-24 my-4 w-full rounded-sm border grid place-items-center hover:bg-slate-100 dark:hover:bg-slate-800 transition text-center"
+                            {...getRootProps(getPasteProps(addTileNote))}
+                          >
+                            <input {...getInputProps()} />
+                            <span>Drop reference image here</span>
                           </div>
                         )}
                       </Dropzone>
                     </div>
                   </div>
-
-                  <div className="mt-4 w-full flex flex-row justify-start">
-                    <Button className="flex flex-row items-center mr-2" onClick={() => deleteTile()}>
-                      <TrashIcon className="h-5 w-5 mr-2" /> Delete tile
-                    </Button>
-
-                    <Button className=" flex flex-row items-center" onClick={() => deleteLinks()}>
-                      <TrashIcon className="h-5 w-5 mr-2" /> Delete links
-                    </Button>
-                  </div>
-                  <button className="absolute right-0 top-0 p-3 hover:bg-slate-100" onClick={() => setIsOpen(false)}>
-                    <XMarkIcon className="w-5 h-5" />
-                  </button>
-                </Dialog.Panel>
-              </Transition.Child>
-            </div>
+                )}
+                <button className="absolute right-0 top-0 p-3 hover:bg-slate-100 dark:hover:bg-slate-800" onClick={() => setIsTileDialogOpen(false)}>
+                  <XMarkIcon className="w-5 h-5" />
+                </button>
+              </Dialog.Panel>
+            </Transition.Child>
           </div>
         </Dialog>
       </Transition>
+
+      <Transition appear show={isExportOpen} as={Fragment}>
+        <Dialog as="div" className="relative z-[80]" onClose={() => setIsExportOpen(false)}>
+          <Transition.Child as={Fragment} enter="ease-out duration-200" enterFrom="opacity-0" enterTo="opacity-100" leave="ease-in duration-150" leaveFrom="opacity-100" leaveTo="opacity-0">
+            <div className="fixed inset-0 bg-black/40" />
+          </Transition.Child>
+          <div className="fixed inset-0 grid place-items-center p-4">
+            <Dialog.Panel className="w-full max-w-md rounded-sm bg-white dark:bg-slate-900 p-6 shadow-xl">
+              <Dialog.Title className="text-lg font-bold mb-4">Download composed map</Dialog.Title>
+              {(Object.keys(exportOptions) as Array<keyof ExportOptions>).map((key) => (
+                <label className="mb-3 flex items-center gap-2" key={key}>
+                  <input
+                    type="checkbox"
+                    checked={exportOptions[key]}
+                    onChange={(event) => setExportOptions({ ...exportOptions, [key]: event.target.checked })}
+                  />
+                  {key.replaceAll(/([A-Z])/g, ' $1')}
+                </label>
+              ))}
+              <div className="mt-5 flex gap-2">
+                <Button onClick={exportMap}>
+                  <ArrowDownTrayIcon className="w-5 h-5 mr-2" /> Download PNG
+                </Button>
+                <Button onClick={() => setIsExportOpen(false)}>Cancel</Button>
+              </div>
+            </Dialog.Panel>
+          </div>
+        </Dialog>
+      </Transition>
+
       <ToastContainer autoClose={2000} position="bottom-left" />
     </div>
   );

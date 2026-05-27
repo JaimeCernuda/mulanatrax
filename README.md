@@ -1,34 +1,93 @@
-# mtrax.exe
+# GameTrax
 
-Web-based mapper/notepad for La-Mulana 1/2 players
+Web-based mapper/notepad for screenshot-driven exploration games. The app name, game name, browser database, and screenshot presets are configurable for different games.
 
-### Features
+## Features
 
-- Drag screenshots to the browser to create a map
-- Add notes and images to individual tiles (with opt-in OCR via your own Google Vision API)
-- Search through notes and maptiles
-- Set tiles as unsolved and display them
-- All data is saved and kept within the browser
-- The tool can be run offline if the Google Vision API integration is not enabled (see below)
+- Create empty map tiles, then load screenshots by drop, file picker, or clipboard paste
+- Expand maps left, right, up, and down while visible labels relabel from the current top-left
+- Keep original pasted/uploaded image data in IndexedDB instead of downscaling to lossy JPEG
+- Toggle dark mode from the main toolbar
+- Add notes and reference images to individual tiles
+- Draw on tiles and drop preset markers for route notes, keys, warnings, and checks
+- Download the composed map as a PNG with selectable labels, links, drawings, markers, and empty cells
+- Optional OCR through your own Google Vision API key
+- Search through notes and map tiles
+- Mark tiles as unsolved and review them later
+- Draw links between tiles for loops, portals, or route hints
+- Store map data, original tile images, drawings, markers, settings, and notes locally in the browser through IndexedDB
 
-### Instructions
+## Local Development
 
-- Install Node.js v16+
-- Download this repository and unzip it somewhere
-- Navigate to the extracted folder using a terminal (Command Prompt, Git Bash, etc.)
-- **Optional**: if you want to have the text of your screenshots automatically detected and added to the tile notes, copy `.env.sample` file and rename the copy to `.env`, replace `GOOGLE_VISION_API_KEY_HERE` with your personal API key from google cloud console.
-- run the command `npm install` to install all necessary dependancies
-- use command `npm run dev` to start the application
-- Point your browser to http://localhost:5173 and start building you maps!
+Install Node.js 22+, then run:
 
-### Notes
+```sh
+npm install
+npm run dev
+```
 
-**La-Mulana 1**
+Open http://localhost:5173.
 
-For best results, set your game to windowed mode and a resolution that has an aspect ratio of 4:3 (e.g. 1280x960).
+Optional OCR setup:
 
-**La-Mulana 2**
+```sh
+cp .env.sample .env
+```
 
-For best results, set your game to windowed mode and use a resolution of 1920x1080.
+Set `VITE_API_KEY` to a Google Vision API key.
 
-Open up the folder where Steam stores your game screenshots so that you can press F12 ingame and then drag the file to the browser.
+## Configuration
+
+Build-time configuration uses Vite env vars:
+
+- `VITE_APP_NAME`: displayed app name
+- `VITE_GAME_NAME`: game name available to runtime configuration
+- `VITE_DB_NAME`: browser IndexedDB name. Use a stable value if you already have saved maps because browser data is keyed by this name.
+- `VITE_SCREENSHOT_PRESETS`: JSON array of screenshot presets
+
+Docker runtime configuration uses the same values with `GAMETRAX_` names:
+
+- `GAMETRAX_APP_NAME`
+- `GAMETRAX_GAME_NAME`
+- `GAMETRAX_DB_NAME`
+- `GAMETRAX_SCREENSHOT_PRESETS`
+- `GAMETRAX_PORT`
+
+Preset JSON shape:
+
+```json
+[
+  {
+    "id": 1,
+    "label": "Full frame 16:9",
+    "tileWidth": 320,
+    "tileHeight": 180,
+    "canvasWidth": 320,
+    "canvasHeight": 180,
+    "ocrCleanup": {
+      "removeText": ["HUD label"],
+      "trailingPattern": "\\nCONFIRM(.|\\s)*$"
+    }
+  }
+]
+```
+
+The built-in default is `Auto detect`, which switches to a common full-frame 16:9 or 4:3 preset based on the first dropped image. Custom preset JSON can still define fixed crop rectangles when you need them for a specific capture workflow.
+
+## Docker
+
+Build and run locally:
+
+```sh
+docker compose up --build -d
+```
+
+The app is served on http://localhost:8080 by default. Set `GAMETRAX_PORT` to change the host port.
+
+## Verification
+
+```sh
+npm run lint
+npm test
+npm run build
+```

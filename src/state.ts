@@ -1,26 +1,14 @@
-import { atom } from 'recoil';
+import { useEffect, useState } from 'react';
 
-const localStorageEffect =
-  (key: string) =>
-  ({ setSelf, onSet }: any) => {
+export function useLocalStorageState<T>(key: string, defaultValue: T): [T, (value: T) => void] {
+  const [value, setValue] = useState<T>(() => {
     const savedValue = localStorage.getItem(key);
-    if (savedValue != null) {
-      setSelf(JSON.parse(savedValue));
-    }
+    return savedValue == null ? defaultValue : (JSON.parse(savedValue) as T);
+  });
 
-    onSet((newValue: any, _: any, isReset: any) => {
-      isReset ? localStorage.removeItem(key) : localStorage.setItem(key, JSON.stringify(newValue));
-    });
-  };
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
 
-export const activemapState = atom({
-  key: 'activemap',
-  default: -1,
-  effects: [localStorageEffect('activemap')],
-});
-
-export const mulanamodeState = atom({
-  key: 'mulanamode',
-  default: 1,
-  effects: [localStorageEffect('mulanamode')],
-});
+  return [value, setValue];
+}

@@ -1,4 +1,5 @@
-import { TileLink } from './db';
+import { AxisLabelMode, ImageCrop, MapTile, TileAnnotation, TileImageFit, TileLink, TileMarker } from './db';
+import { detectScreenshotPreset, getScreenshotPreset } from './presets';
 
 export function seededRandomColor(seed: string) {
   let res = 0;
@@ -7,44 +8,181 @@ export function seededRandomColor(seed: string) {
   return '#' + Math.floor(Math.abs(Math.sin(res) * 16777215) % 16777215).toString(16);
 }
 
-export const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
 export async function readFileAsDataURL(file: File): Promise<string> {
-  let result_base64: string = await new Promise((resolve) => {
-    let fileReader = new FileReader();
-    fileReader.onload = (e) => resolve(fileReader.result as string);
+  const resultBase64: string = await new Promise((resolve) => {
+    const fileReader = new FileReader();
+    fileReader.onload = () => resolve(fileReader.result as string);
     fileReader.readAsDataURL(file);
   });
 
-  return result_base64;
+  return resultBase64;
 }
 
-export async function getImageSrc(files: File[], mode: number = 1) {
+export interface ProcessedImage {
+  imgSrc: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  crop: ImageCrop;
+  fit: TileImageFit;
+  presetId: number;
+}
+
+export function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not load image'));
+    img.src = src;
+  });
+}
+
+export async function processImageFile(files: File[], presetId: number = 0): Promise<ProcessedImage | undefined> {
   const file = files[0];
-  const result = await readFileAsDataURL(file);
-  const c: HTMLCanvasElement = document.getElementById('cropcanvas') as any;
-  const ctx = c.getContext('2d');
-  if (!ctx) {
+  if (!file) {
     return;
   }
-  ctx.clearRect(0, 0, c.width, c.height);
-  const img = new Image();
-  img.src = result;
-  await img.decode();
-  const sourceX = mode === 2 ? 128 : 0;
-  const sourceY = mode === 2 ? 60 : 0;
-  const sourceWidth = mode === 2 ? 1664 : 1280;
-  const sourceHeight = mode === 2 ? 926 : 960;
-  const destWidth = sourceWidth / 2;
-  const destHeight = sourceHeight / 2;
-  const destX = 0;
-  const destY = 0;
-  ctx.drawImage(img, sourceX, sourceY, sourceWidth, sourceHeight, destX, destY, destWidth, destHeight);
-  return c.toDataURL('image/jpeg', 0.8);
+  const result = await readFileAsDataURL(file);
+  const img = await loadImage(result);
+  const requestedPreset = getScreenshotPreset(presetId);
+  const preset = requestedPreset.autoDetect ? detectScreenshotPreset(img.naturalWidth, img.naturalHeight) : requestedPreset;
+  const sourceX = preset.crop?.sourceX ?? 0;
+  const sourceY = preset.crop?.sourceY ?? 0;
+  const sourceWidth = preset.crop?.sourceWidth ?? img.naturalWidth;
+  const sourceHeight = preset.crop?.sourceHeight ?? img.naturalHeight;
+
+  return {
+    imgSrc: result,
+    naturalWidth: img.naturalWidth,
+    naturalHeight: img.naturalHeight,
+    crop: {
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+    },
+    fit: 'contain',
+    presetId: preset.id,
+  };
+}
+
+export function getTileImage(tile: MapTile | TilePictureLike | null | undefined): string | undefined {
+  return tile?.originalImg ?? tile?.img;
+}
+
+interface TilePictureLike {
+  img?: string;
+  originalImg?: string;
+}
+
+export function formatAxisLabel(index: number, mode: AxisLabelMode): string {
+  const visibleIndex = index + 1;
+  if (mode === 'numbers') {
+    return String(visibleIndex);
+  }
+
+  let value = visibleIndex;
+  let label = '';
+  while (value > 0) {
+    value -= 1;
+    label = alphabet[value % alphabet.length] + label;
+    value = Math.floor(value / alphabet.length);
+  }
+  return label;
+}
+
+export function tileDisplayName(
+  tile: Pick<MapTile, 'x' | 'y'>,
+  minX: number,
+  minY: number,
+  columnMode: AxisLabelMode,
+  rowMode: AxisLabelMode
+): string {
+  return `${formatAxisLabel(tile.x - minX, columnMode)}-${formatAxisLabel(tile.y - minY, rowMode)}`;
+}
+
+export function getObjectFit(tile: MapTile | null | undefined): TileImageFit {
+  return tile?.fit ?? 'contain';
+}
+
+export function drawImageIntoRect(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  fit: TileImageFit,
+  crop?: ImageCrop
+) {
+  const sx = crop?.sourceX ?? 0;
+  const sy = crop?.sourceY ?? 0;
+  const sw = crop?.sourceWidth ?? img.naturalWidth;
+  const sh = crop?.sourceHeight ?? img.naturalHeight;
+
+  if (fit === 'contain') {
+    const scale = Math.min(dw / sw, dh / sh);
+    const width = sw * scale;
+    const height = sh * scale;
+    ctx.drawImage(img, sx, sy, sw, sh, dx + (dw - width) / 2, dy + (dh - height) / 2, width, height);
+    return;
+  }
+
+  const sourceRatio = sw / sh;
+  const destRatio = dw / dh;
+  let coverSx = sx;
+  let coverSy = sy;
+  let coverSw = sw;
+  let coverSh = sh;
+
+  if (sourceRatio > destRatio) {
+    coverSw = sh * destRatio;
+    coverSx = sx + (sw - coverSw) / 2;
+  } else {
+    coverSh = sw / destRatio;
+    coverSy = sy + (sh - coverSh) / 2;
+  }
+
+  ctx.drawImage(img, coverSx, coverSy, coverSw, coverSh, dx, dy, dw, dh);
+}
+
+export function annotationPath(points: TileAnnotation['points'], width: number, height: number): string {
+  return points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x * width} ${point.y * height}`)
+    .join(' ');
+}
+
+export function markerLabel(marker: TileMarker): string {
+  return marker.label ?? marker.type;
+}
+
+export function cleanDetectedText(text: string | undefined, presetId: number) {
+  if (!text) {
+    return '';
+  }
+
+  const preset = getScreenshotPreset(presetId);
+  const trailingControlText = preset.ocrCleanup?.trailingPattern
+    ? new RegExp(preset.ocrCleanup.trailingPattern)
+    : undefined;
+
+  const textWithoutIgnoredPhrases = preset.ocrCleanup?.removeText?.reduce(
+    (result, phrase) => result.replaceAll(phrase, ''),
+    text
+  ) ?? text;
+
+  return textWithoutIgnoredPhrases
+    .replaceAll(/^[\d]*\s*/gm, '')
+    .replace(trailingControlText ?? /$(?![\s\S])/, '')
+    .trim();
 }
 
 export function drawLinks(links: TileLink[]) {
-  const c: HTMLCanvasElement = document.getElementById('linecanvas') as any;
+  const c = document.getElementById('linecanvas') as HTMLCanvasElement | null;
+  if (!c) {
+    return;
+  }
   const ctx = c.getContext('2d');
   if (!ctx) {
     return;

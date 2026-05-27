@@ -1,0 +1,13 @@
+services:
+  gametrax:
+    build: .
+    image: gametrax:latest
+    container_name: gametrax
+    restart: unless-stopped
+    ports:
+      - "${GAMETRAX_PORT:-8080}:80"
+    environment:
+      GAMETRAX_APP_NAME: "${GAMETRAX_APP_NAME:-GameTrax}"
+      GAMETRAX_GAME_NAME: "${GAMETRAX_GAME_NAME:-your game}"
+      GAMETRAX_DB_NAME: "${GAMETRAX_DB_NAME:-gametraxdb}"
+      GAMETRAX_SCREENSHOT_PRESETS: "${GAMETRAX_SCREENSHOT_PRESETS:-undefined}"

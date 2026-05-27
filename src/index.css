@@ -1,6 +1,63 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@plugin "@tailwindcss/forms";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+body {
+    background: #f8fafc;
+    color: #0f172a;
+}
+
+.dark body {
+    background: #020617;
+    color: #e2e8f0;
+}
+
+.dark .bg-white {
+    background-color: #0f172a !important;
+}
+
+.dark .bg-slate-50,
+.dark .hover\:bg-slate-50:hover,
+.dark .hover\:bg-slate-100:hover {
+    background-color: #1e293b !important;
+}
+
+.dark .text-slate-800,
+.dark .text-gray-600,
+.dark .text-gray-500 {
+    color: #cbd5e1 !important;
+}
+
+.dark .border,
+.dark .border-2,
+.dark .border-gray-500 {
+    border-color: #475569 !important;
+}
+
+.dark input,
+.dark select,
+.dark textarea {
+    background-color: #020617;
+    border-color: #475569;
+    color: #e2e8f0;
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+    color: #94a3b8;
+}
+
+.dark .shadow,
+.dark .shadow-xl,
+.dark .drop-shadow {
+    box-shadow: 0 10px 30px rgb(0 0 0 / 0.45) !important;
+}
+
+.dark .Toastify__toast {
+    background: #0f172a;
+    color: #e2e8f0;
+}
 
 * {
     scrollbar-width: thin;
